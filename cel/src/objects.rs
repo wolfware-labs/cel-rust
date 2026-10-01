@@ -902,9 +902,7 @@ impl<'b, 'v> TryFrom<&'b (dyn Val + 'v)> for Value {
             Kind::Int => Ok(Value::Int(*built_in::<CelInt>(v)?.inner())),
             Kind::UInt => Ok(Value::UInt(*built_in::<CelUInt>(v)?.inner())),
             Kind::Double => Ok(Value::Float(*built_in::<CelDouble>(v)?.inner())),
-            Kind::String => Ok(Value::String(Arc::new(
-                built_in::<CelString>(v)?.inner().to_string(),
-            ))),
+            Kind::String => Ok(Value::String(built_in::<CelString>(v)?.to_arc())),
             Kind::NullType => Ok(Value::Null),
             Kind::Bytes => Ok(Value::Bytes(Arc::new(
                 built_in::<CelBytes>(v)?.inner().to_vec(),
@@ -968,7 +966,7 @@ impl TryFrom<Value> for Box<dyn Val> {
             Value::Int(i) => Ok(Box::new(CelInt::from(i))),
             Value::UInt(u) => Ok(Box::new(CelUInt::from(u))),
             Value::Float(f) => Ok(Box::new(CelDouble::from(f))),
-            Value::String(s) => Ok(Box::new(CelString::from(Arc::unwrap_or_clone(s)))),
+            Value::String(s) => Ok(Box::new(CelString::from(s))),
             Value::Null => Ok(Box::new(CelNull)),
             Value::Bytes(b) => Ok(Box::new(CelBytes::from(b.as_slice().to_vec()))),
             #[cfg(feature = "chrono")]
@@ -2723,6 +2721,41 @@ mod tests {
 
     /// `has()` asks whether the value has the field, whatever its kind: as
     /// cel-go's `refQualify` does, it goes by what the value can do.
+    /// Strings, bytes, lists and maps are shared with the [`Value`]s they are
+    /// converted from and to, not copied.
+    mod sharing {
+        use crate::{Context, Program, Value};
+        use std::sync::Arc;
+
+        fn execute(ctx: &Context, expr: &str) -> Value {
+            Program::compile(expr).unwrap().execute(ctx).unwrap()
+        }
+
+        #[test]
+        fn string_roundtrip_shares() {
+            let arc = Arc::new("cel-rust".to_owned());
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("s", Value::String(arc.clone()));
+            let Value::String(out) = execute(&ctx, "s") else {
+                panic!("expected a string")
+            };
+            assert!(Arc::ptr_eq(&out, &arc));
+        }
+
+        #[test]
+        fn string_argument_shares() {
+            let arc = Arc::new("cel-rust".to_owned());
+            let mut ctx = Context::default();
+            ctx.add_function("addr", |s: Arc<String>| Arc::as_ptr(&s) as usize as u64)
+                .unwrap();
+            ctx.add_variable_from_value("s", Value::String(arc.clone()));
+            assert_eq!(
+                execute(&ctx, "addr(s)"),
+                Value::UInt(Arc::as_ptr(&arc) as usize as u64)
+            );
+        }
+    }
+
     mod presence {
         use crate::common::traits::Indexer;
         use crate::common::types::{CelString, Kind, Type};
