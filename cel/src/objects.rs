@@ -1029,11 +1029,38 @@ impl Value {
     }
 
     pub fn resolve(expr: &Expression, ctx: &Context) -> ResolveResult {
-        Self::with_frame(ctx, |ctx| {
-            let value = Self::resolve_val(expr, ctx)?;
-            charge_conversion(ctx.frame(), value.as_ref())?;
-            value.as_ref().try_into()
-        })
+        Self::with_frame(ctx, |ctx| Self::resolve_to_value(expr, ctx))
+    }
+
+    /// Evaluates `expr` within the frame `ctx` carries, if any, and converts
+    /// the result into a [`Value`], charging the conversion.
+    fn resolve_to_value(expr: &Expression, ctx: &Context) -> ResolveResult {
+        let value = Self::resolve_val(expr, ctx)?;
+        charge_conversion(ctx.frame(), value.as_ref())?;
+        value.as_ref().try_into()
+    }
+
+    /// Evaluates `expr` like [`resolve`](Self::resolve), and reports the
+    /// resources the evaluation used.
+    pub fn resolve_with_usage(
+        expr: &Expression,
+        ctx: &Context,
+    ) -> (ResolveResult, crate::EvalUsage) {
+        match ctx.frame() {
+            // a nested evaluation: report what it added to the shared frame
+            Some(frame) => {
+                let before = frame.usage();
+                let result = Self::resolve_to_value(expr, ctx);
+                (result, frame.usage().since(&before))
+            }
+            // count even when nothing is enforced
+            None => {
+                let frame = ctx.new_counting_frame();
+                let result =
+                    frame.finish(Self::resolve_to_value(expr, &ctx.new_frame_scope(&frame)));
+                (result, frame.usage())
+            }
+        }
     }
 
     /// Runs `f` within the evaluation frame of `ctx`, creating one if this is

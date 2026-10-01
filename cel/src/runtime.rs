@@ -278,6 +278,35 @@ impl std::fmt::Display for BudgetKind {
     }
 }
 
+/// The resources one evaluation used, as reported by
+/// [`Program::execute_with_usage`](crate::Program::execute_with_usage) and
+/// [`Value::resolve_with_usage`](crate::Value::resolve_with_usage).
+///
+/// The counts are those the budgets of [`RuntimeOptions`] are enforced
+/// against, whether or not a budget is set. When a budget is exceeded they
+/// include the charge that exceeded it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EvalUsage {
+    /// Evaluation steps, see [`RuntimeOptions::with_max_steps`].
+    pub steps: u64,
+    /// Allocated bytes, see [`RuntimeOptions::with_max_bytes`].
+    pub bytes: u64,
+    /// Comprehension iterations, see [`RuntimeOptions::with_max_iterations`].
+    pub iterations: u64,
+}
+
+impl EvalUsage {
+    /// The usage accrued since `earlier`, a snapshot of the same frame.
+    pub(crate) fn since(&self, earlier: &EvalUsage) -> EvalUsage {
+        EvalUsage {
+            steps: self.steps.saturating_sub(earlier.steps),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+            iterations: self.iterations.saturating_sub(earlier.iterations),
+        }
+    }
+}
+
 const ABORT_NONE: u8 = 0;
 const ABORT_BUDGET: u8 = 1;
 const ABORT_INTERRUPTED: u8 = 2;
@@ -344,6 +373,15 @@ impl<'a> Frame<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The resources used so far by the evaluation.
+    pub(crate) fn usage(&self) -> EvalUsage {
+        EvalUsage {
+            steps: self.steps.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            iterations: self.iterations.load(Ordering::Relaxed),
+        }
     }
 
     /// Charges `steps` evaluation steps against the steps budget.
@@ -951,6 +989,63 @@ mod tests {
         ctx.add_function("hasFrame", has_frame).unwrap();
         ctx.set_interrupt(&interrupt);
         assert_eq!(run(&ctx, "hasFrame()"), Ok(true.into()));
+    }
+
+    #[test]
+    fn usage_is_reported() {
+        let ctx = Context::default();
+        let (result, usage) = Program::compile("1 + 1").unwrap().execute_with_usage(&ctx);
+        assert_eq!(result, Ok(2.into()));
+        assert_eq!((usage.steps, usage.bytes, usage.iterations), (3, 0, 0));
+
+        let (result, usage) = Program::compile("'abc' + 'def'")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, Ok("abcdef".into()));
+        assert_eq!(usage.bytes, 6);
+
+        let (result, usage) = Program::compile("[1, 2, 3].all(x, x > 0)")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, Ok(true.into()));
+        assert_eq!(usage.iterations, 3);
+        assert!(usage.steps > 3);
+    }
+
+    #[test]
+    fn usage_matches_value_resolve() {
+        let ctx = Context::default();
+        let program = Program::compile("[1, 2].map(x, x * 2)").unwrap();
+        let (result, usage) = Value::resolve_with_usage(program.expression(), &ctx);
+        assert_eq!(result, program.execute(&ctx));
+        assert_eq!(usage, program.execute_with_usage(&ctx).1);
+        assert_eq!(usage.iterations, 2);
+    }
+
+    #[test]
+    fn usage_is_reported_when_the_budget_is_exceeded() {
+        let ctx = steps_budget(2);
+        let (result, usage) = Program::compile("1 + 1").unwrap().execute_with_usage(&ctx);
+        assert_eq!(result, steps_exceeded(2));
+        assert!(usage.steps > 2);
+    }
+
+    #[test]
+    fn nested_usage_reports_the_nested_evaluation_only() {
+        fn nested(ftx: &FunctionContext) -> ResolveResult {
+            let program = Program::compile("1 + 1").unwrap();
+            let (result, usage) = program.execute_with_usage(ftx.ptx);
+            assert_eq!(usage.steps, 3);
+            result
+        }
+        let mut ctx = steps_budget(1_000);
+        ctx.add_function("nested", nested).unwrap();
+        let (result, usage) = Program::compile("1 + 1 + nested()")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, Ok(4.into()));
+        // 5 nodes, one dispatch and the nested evaluation's 3 steps
+        assert_eq!(usage.steps, 9);
     }
 
     #[test]

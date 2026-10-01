@@ -273,6 +273,12 @@ impl<'p, 'v> Context<'p, 'v> {
         Some(Frame::new(options, interrupt))
     }
 
+    /// Creates a [`Frame`] for a new evaluation under this context even when
+    /// there is nothing to enforce, to count the resources it uses.
+    pub(crate) fn new_counting_frame(&self) -> Frame<'v> {
+        Frame::new(self.budget(), self.interrupt())
+    }
+
     /// Creates an inner scope evaluating within `frame`, which the caller owns
     /// (typically on its stack) for the duration of the evaluation.
     ///

@@ -41,7 +41,7 @@ mod magic;
 pub mod objects;
 mod resolvers;
 pub mod runtime;
-pub use runtime::{BudgetKind, Deadline, Interrupt, RuntimeOptions};
+pub use runtime::{BudgetKind, Deadline, EvalUsage, Interrupt, RuntimeOptions};
 
 #[cfg(feature = "chrono")]
 mod duration;
@@ -434,6 +434,12 @@ impl Program {
 
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
+    }
+
+    /// Executes the program like [`execute`](Self::execute), and reports the
+    /// resources the evaluation used.
+    pub fn execute_with_usage(&self, context: &Context) -> (ResolveResult, EvalUsage) {
+        Value::resolve_with_usage(&self.expression, context)
     }
 
     /// Returns the variables and functions referenced by the CEL program
