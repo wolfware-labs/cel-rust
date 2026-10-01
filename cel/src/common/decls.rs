@@ -25,13 +25,15 @@ impl FunctionDecl {
         member_function: bool,
         args: &[CowVal<'_, '_>],
     ) -> Option<Function> {
-        self.find_op(member_function, args).and_then(Op::plain)
+        self.find_op(member_function, args)
+            .copied()
+            .and_then(Op::plain)
     }
 
     /// How to call the overload `args` call, whatever its kind.
-    pub(crate) fn find_op(&self, member_function: bool, args: &[CowVal<'_, '_>]) -> Option<Op> {
+    pub(crate) fn find_op(&self, member_function: bool, args: &[CowVal<'_, '_>]) -> Option<&Op> {
         self.find_overload_decl(member_function, args)
-            .map(|overload| overload.op)
+            .map(|overload| &overload.op)
     }
 
     /// The overload [`find_op`](Self::find_op) would call.

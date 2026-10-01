@@ -985,6 +985,7 @@ mod tests {
         crate::add_member_overload!(env, fn ping2: (CelString, CelString) -> CelInt);
         let wrapper = env
             .find_member_overload("ping2", &[string_arg(), string_arg()])
+            .copied()
             .and_then(crate::common::functions::Op::plain)
             .unwrap();
 

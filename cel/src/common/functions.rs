@@ -79,12 +79,12 @@ impl Op {
     /// Calls the overload on `args`, in the evaluation of `env` and `frame`.
     #[inline(always)]
     pub(crate) fn call<'b, 'v>(
-        self,
+        &self,
         env: &Env,
         frame: Option<&Frame<'_>>,
         args: Vec<CowVal<'b, 'v>>,
     ) -> Result<CowVal<'b, 'v>, ExecutionError> {
-        match self {
+        match *self {
             Op::Plain(op) => op(args),
             Op::WithEnv(op) => op(&EvalCtx { env, frame }, args),
         }

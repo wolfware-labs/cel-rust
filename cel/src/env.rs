@@ -176,11 +176,11 @@ impl Env {
     /// An overload added with [`add_overload_with_env`](Self::add_overload_with_env)
     /// is not returned: it cannot be called without the evaluation.
     pub fn find_overload(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<Function> {
-        self.find_op(name, args).and_then(Op::plain)
+        self.find_op(name, args).copied().and_then(Op::plain)
     }
 
     /// How to call the global overload `name` that `args` call, whatever its kind.
-    pub(crate) fn find_op(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<Op> {
+    pub(crate) fn find_op(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<&Op> {
         self.functions
             .get(name)
             .and_then(|fn_decl| fn_decl.find_op(false, args))
@@ -261,7 +261,7 @@ impl Env {
 
     /// How to call the member overload `name` that `args` (the receiver
     /// first) call, whatever its kind.
-    pub(crate) fn find_member_overload(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<Op> {
+    pub(crate) fn find_member_overload(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<&Op> {
         self.functions
             .get(name)
             .and_then(|fn_decl| fn_decl.find_op(true, args))
