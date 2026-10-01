@@ -431,6 +431,13 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// How many list elements the budget left can still pay for, each costing
+    /// at least a step and a [`LIST_SLOT`]: the cap on a preallocation.
+    pub(crate) fn elements_left(&self) -> usize {
+        let elements = self.steps_left().min(self.bytes_left() / LIST_SLOT);
+        usize::try_from(elements).unwrap_or(usize::MAX)
+    }
+
     /// The longest regex pattern `matches` accepts, zero meaning unlimited.
     pub(crate) fn max_regex_len(&self) -> u64 {
         self.max_regex_len

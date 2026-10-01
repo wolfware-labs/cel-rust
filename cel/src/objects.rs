@@ -1739,9 +1739,15 @@ impl<'e> AppendStep<'e> {
             .as_sizer()
             .map(|s| *s.size().inner() as usize)
             .unwrap_or(0);
+        let frame = ctx.frame();
+        // Under a budget, reserve no more than the budget can pay for: every
+        // element costs at least a step and a list slot.
+        let size_hint = match frame {
+            Some(frame) => size_hint.min(frame.elements_left()),
+            None => size_hint,
+        };
         let mut accu = MutableList::with_capacity(size_hint);
 
-        let frame = ctx.frame();
         let mut ctx = ctx.new_inner_scope();
         let mut items = iter
             .as_iterable()
