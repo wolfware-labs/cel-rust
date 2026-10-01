@@ -66,6 +66,20 @@ fn a_hit_is_charged_only_the_lookup_and_the_match() {
 }
 
 #[test]
+fn a_prewarmed_pattern_is_a_hit() {
+    let env = Env::stdlib();
+    env.regex_cache().prewarm(PATH_PATTERN, 1 << 20).unwrap();
+    // another limit is another entry
+    env.regex_cache().prewarm(PATH_PATTERN, 0).unwrap();
+    assert_eq!(env.regex_cache().len(), 2);
+    let mut ctx = context(env);
+    ctx.set_budget(gateway_budget());
+    let (result, usage) = run(&ctx, "path.matches(p)");
+    assert_eq!(result, Ok(true.into()));
+    assert!(usage.steps <= 60, "{usage:?}");
+}
+
+#[test]
 fn a_cached_error_is_a_cheap_hit() {
     for pattern in ["(", r"\p{Bogus}", r"\w{1000}"] {
         let mut ctx = context(Env::stdlib());

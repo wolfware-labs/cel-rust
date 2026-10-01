@@ -214,6 +214,38 @@ impl RegexCache {
         drop(evicted);
     }
 
+    /// Compiles `pattern` as `matches` does in an evaluation with a
+    /// [`RuntimeOptions::with_regex_size_limit`](crate::RuntimeOptions::with_regex_size_limit)
+    /// of `regex_size_limit` (zero meaning the `regex` crate's default), and
+    /// keeps it: the first such evaluation to match it is then charged as a
+    /// hit. Patterns the cache does not keep (see [`RegexCacheOptions`]) are
+    /// compiled and dropped.
+    ///
+    /// # Errors
+    ///
+    /// The error `matches` reports for the pattern, which is kept too.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{Context, Env, Program, RuntimeOptions};
+    /// use std::sync::Arc;
+    ///
+    /// let env = Env::stdlib();
+    /// // the patterns of the rules, compiled as their evaluations will
+    /// env.regex_cache().prewarm("^/api/v[0-9]+/", 1 << 20).unwrap();
+    /// assert!(env.regex_cache().prewarm("(", 1 << 20).is_err());
+    ///
+    /// let mut ctx = Context::with_env(Arc::new(env));
+    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(100).with_regex_size_limit(1 << 20));
+    /// let program = Program::compile("'/api/v1/users'.matches('^/api/v[0-9]+/')").unwrap();
+    /// assert_eq!(program.execute(&ctx), Ok(true.into()));
+    /// ```
+    pub fn prewarm(&self, pattern: &str, regex_size_limit: u64) -> Result<(), ExecutionError> {
+        self.get(pattern, size_limit(regex_size_limit))
+            .regex()
+            .map(|_| ())
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         // the map is consistent between statements: a panic cannot leave it
         // half-updated
