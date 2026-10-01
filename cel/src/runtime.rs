@@ -141,6 +141,7 @@ pub struct RuntimeOptions {
     interrupt_check_frequency: u64,
     max_steps: u64,
     max_bytes: u64,
+    max_regex_len: u64,
 }
 
 impl Default for RuntimeOptions {
@@ -151,6 +152,7 @@ impl Default for RuntimeOptions {
             interrupt_check_frequency: 1,
             max_steps: 0,
             max_bytes: 0,
+            max_regex_len: 0,
         }
     }
 }
@@ -189,9 +191,10 @@ impl RuntimeOptions {
     /// One step is charged for every expression node evaluated and for every
     /// function or overload dispatched. Operations whose cost grows with their
     /// operands are charged in proportion: `in` on a list and `==`/`!=` on
-    /// lists or maps cost one step per element walked, and the string
-    /// functions `contains`, `startsWith`, `endsWith` and `matches` one step
-    /// per 64 bytes of the string searched. Comprehension iterations are
+    /// lists or maps cost one step per element walked, the string
+    /// functions `contains`, `startsWith` and `endsWith` one step per 64
+    /// bytes of the string searched, and `matches` the product of the
+    /// pattern's and the subject's 64-byte counts, charged before matching. Comprehension iterations are
     /// charged through the nodes they evaluate, so a steps budget bounds them
     /// too, nested ones included.
     ///
@@ -252,9 +255,28 @@ impl RuntimeOptions {
         self.max_bytes
     }
 
+    /// Caps the length, in bytes, of a regular expression pattern passed to
+    /// `matches`. Longer patterns fail with an
+    /// [`ExecutionError::FunctionError`](crate::ExecutionError::FunctionError)
+    /// before they are compiled.
+    ///
+    /// Zero, the default, means unlimited.
+    pub fn with_max_regex_len(mut self, max_regex_len: u64) -> Self {
+        self.max_regex_len = max_regex_len;
+        self
+    }
+
+    /// The regex pattern length limit, zero meaning unlimited.
+    pub fn max_regex_len(&self) -> u64 {
+        self.max_regex_len
+    }
+
     /// Whether these options set no budget of any kind.
     pub(crate) fn is_unbounded(&self) -> bool {
-        self.max_iterations == 0 && self.max_steps == 0 && self.max_bytes == 0
+        self.max_iterations == 0
+            && self.max_steps == 0
+            && self.max_bytes == 0
+            && self.max_regex_len == 0
     }
 }
 
@@ -333,6 +355,7 @@ pub struct Frame<'a> {
     steps: AtomicU64,
     max_bytes: u64,
     bytes: AtomicU64,
+    max_regex_len: u64,
 }
 
 impl<'a> Frame<'a> {
@@ -348,6 +371,7 @@ impl<'a> Frame<'a> {
             steps: AtomicU64::new(0),
             max_bytes: options.max_bytes,
             bytes: AtomicU64::new(0),
+            max_regex_len: options.max_regex_len,
         }
     }
 
@@ -373,6 +397,11 @@ impl<'a> Frame<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The longest regex pattern `matches` accepts, zero meaning unlimited.
+    pub(crate) fn max_regex_len(&self) -> u64 {
+        self.max_regex_len
     }
 
     /// The resources used so far by the evaluation.
@@ -751,6 +780,41 @@ mod tests {
         let mut ctx = steps_budget(500);
         ctx.add_variable("s", "x".repeat(64 * 1_000)).unwrap();
         assert_eq!(run(&ctx, "s.matches('y')"), steps_exceeded(500));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_matches_by_pattern_times_subject() {
+        // Matching is O(pattern x subject): an 8 KiB string matched against
+        // itself takes most of a second, and must be refused before it runs.
+        let mut ctx = steps_budget(10_000);
+        ctx.add_variable("s", "a".repeat(8 * 1024)).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(run(&ctx, "s.matches(s)"), steps_exceeded(10_000));
+        assert_eq!(
+            run(&ctx, "[1, 2, 3].all(x, s.matches(s))"),
+            steps_exceeded(10_000)
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // a short pattern over the same subject still fits
+        assert_eq!(run(&ctx, "s.matches('^a+$')"), Ok(true.into()));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn max_regex_len_rejects_longer_patterns() {
+        let mut ctx = with_options(RuntimeOptions::default().with_max_regex_len(8));
+        ctx.add_variable("p", "a".repeat(9)).unwrap();
+        assert_eq!(run(&ctx, "'aaa'.matches('^a+$')"), Ok(true.into()));
+        assert_eq!(
+            run(&ctx, "'aaa'.matches(p)"),
+            Err(ExecutionError::function_error(
+                "matches",
+                "regex pattern of 9 bytes exceeds the limit of 8 bytes"
+            ))
+        );
+        // off by default
+        assert_eq!(RuntimeOptions::default().max_regex_len(), 0);
     }
 
     fn bytes_budget(max_bytes: u64) -> Context<'static, 'static> {

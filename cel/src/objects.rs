@@ -1894,25 +1894,49 @@ fn charge_conversion(frame: Option<&Frame<'_>>, value: &dyn Val) -> Result<(), E
 
 /// Charges the steps of dispatching the function `name` on `args`: one, plus
 /// one per 64 bytes of the string searched by the string functions whose cost
-/// grows with it.
+/// grows with it, and for `matches`, whose cost grows with the pattern times
+/// the subject, the product of both counts. A `matches` pattern longer than
+/// [`RuntimeOptions::max_regex_len`](crate::RuntimeOptions::max_regex_len)
+/// is refused here, before it is compiled.
 #[inline(always)]
 fn charge_dispatch(ctx: &Context, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
     match ctx.frame() {
-        Some(frame) if !dispatch_in(frame, name, args) => Err(frame.exceeded()),
-        _ => Ok(()),
+        Some(frame) => dispatch_in(frame, name, args),
+        None => Ok(()),
     }
 }
 
 #[inline(never)]
-fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> bool {
+fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
+    let string_len = |i: usize| {
+        args.get(i)
+            .and_then(|arg| arg.downcast_ref::<CelString>())
+            .map(|s| s.inner().len() as u64)
+    };
     let scan = match name {
-        "contains" | "startsWith" | "endsWith" | "matches" => args
-            .first()
-            .and_then(|subject| subject.downcast_ref::<CelString>())
-            .map_or(0, |subject| subject.inner().len() as u64 / 64 + 1),
+        "contains" | "startsWith" | "endsWith" => string_len(0).map_or(0, |len| len / 64 + 1),
+        "matches" => {
+            match (string_len(0), string_len(1)) {
+                (Some(subject), Some(pattern)) => {
+                    let limit = frame.max_regex_len();
+                    if limit > 0 && pattern > limit {
+                        return Err(ExecutionError::function_error(
+                        "matches",
+                        format!("regex pattern of {pattern} bytes exceeds the limit of {limit} bytes"),
+                    ));
+                    }
+                    (pattern / 64 + 1).saturating_mul(subject / 64 + 1)
+                }
+                (Some(subject), None) => subject / 64 + 1,
+                _ => 0,
+            }
+        }
         _ => 0,
     };
-    frame.add_steps(1 + scan)
+    match frame.add_steps(1u64.saturating_add(scan)) {
+        true => Ok(()),
+        false => Err(frame.exceeded()),
+    }
 }
 
 /// Charges the steps of comparing two lists or two maps: one per element of
