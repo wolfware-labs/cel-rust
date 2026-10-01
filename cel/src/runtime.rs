@@ -478,6 +478,9 @@ impl<'a> Frame<'a> {
     /// same), bounded by [`RuntimeOptions::with_regex_size_limit`]. The
     /// charges are calibrated on measured CPU, about 80 ns per step:
     ///
+    /// - parsing: the pattern is parsed twice, to price it and to compile
+    ///   it, each charged per byte before either runs, see
+    ///   `regex_cost::parse_steps`;
     /// - translating: priced from the parsed pattern before compiling, see
     ///   `regex_cost::translation_steps` (Unicode and Perl classes, and under
     ///   `(?i)` the case folding of every Unicode class, range and literal);
@@ -490,7 +493,11 @@ impl<'a> Frame<'a> {
     #[cfg(feature = "regex")]
     pub(crate) fn is_match(&self, subject: &str, pattern: &str) -> Result<bool, ExecutionError> {
         use regex_automata::{meta, util::syntax, MatchKind};
-        // translating the pattern, priced from its syntax before it runs
+        // parsing the pattern twice, to price it and to compile it, then
+        // translating it, priced from its syntax: each charged before it runs
+        if !self.add_steps(crate::regex_cost::parse_steps(pattern)) {
+            return Err(self.exceeded());
+        }
         if !self.add_steps(crate::regex_cost::translation_steps(
             pattern,
             self.steps_left(),
@@ -1139,6 +1146,38 @@ mod tests {
                     "{head} (max_regex_len {max_regex_len}) took {elapsed:?}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_regex_parsing() {
+        // A pattern is parsed twice, to price it and to compile it, at up to
+        // ~470 ns a byte each, even when the parse fails: too deep a nesting
+        // fails only once the whole pattern is parsed. Both parses are
+        // charged per byte before either runs.
+        for pattern in [
+            format!("{}a{}", "(".repeat(4_000), ")".repeat(4_000)),
+            format!("{}a{}", "[".repeat(4_000), "]".repeat(4_000)),
+            format!("[{}\\w]", r"\w&&".repeat(4_095)),
+            "(".repeat(16_384),
+        ] {
+            let len = pattern.len() as u64;
+            // a third of what parsing it twice costs
+            let limit = len * 3;
+            let mut ctx = with_options(
+                RuntimeOptions::default()
+                    .with_max_steps(limit)
+                    .with_regex_size_limit(1 << 20),
+            );
+            ctx.add_variable("p", pattern.clone()).unwrap();
+            let head: std::string::String = pattern.chars().take(24).collect();
+            let result = run(&ctx, "'a'.matches(p)");
+            let shown: std::string::String = format!("{result:?}").chars().take(80).collect();
+            assert!(
+                result == steps_exceeded(limit),
+                "{head} ({len} bytes): {shown}"
+            );
         }
     }
 

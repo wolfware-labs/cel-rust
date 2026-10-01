@@ -10,6 +10,10 @@
 //! Calibrated with regex 1.13 / regex-syntax 0.8 in release, at the
 //! budget's reference of about 80 ns per step:
 //!
+//! - parsing costs up to ~470 ns per byte of pattern (a byte inside a
+//!   bracketed class, or an open group), and a pattern is parsed twice: once
+//!   to price it, once to compile it. A parse that fails costs as much: too
+//!   deep a nesting fails only once the whole pattern is parsed;
 //! - every Unicode or Perl class costs up to ~12 µs to look up and union;
 //! - case folding a Unicode class or range iterates every codepoint of each
 //!   of its ranges that contains a case-mapped codepoint (~10 ns each), does
@@ -26,6 +30,9 @@ const CLASS_ITEM: u64 = 150;
 /// Steps every compile costs, whatever the pattern: building the meta
 /// regex's engines takes ~25 µs even for a short pattern.
 const COMPILE: u64 = 300;
+/// Steps per byte of pattern for its two parses, the pricing one and the
+/// compile's, at up to ~470 ns a byte each.
+const PARSE_BYTE: u64 = 10;
 /// Steps per literal character when case insensitive: each becomes a
 /// small class and the literal prefilters are built over the variants.
 const FOLDED_LITERAL: u64 = 50;
@@ -173,15 +180,25 @@ impl<'p> ast::Visitor for Collect<'p> {
     }
 }
 
+/// The steps compiling `pattern` costs before its translation: [`COMPILE`]
+/// steps and [`PARSE_BYTE`] steps per byte, for the parse that prices it and
+/// the compile's own, whether or not they succeed. Charged before either
+/// parse runs.
+pub(crate) fn parse_steps(pattern: &str) -> u64 {
+    (pattern.len() as u64)
+        .saturating_mul(PARSE_BYTE)
+        .saturating_add(COMPILE)
+}
+
 /// The steps translating `pattern` costs, counted until they pass `cap`.
 ///
-/// [`COMPILE`] steps, one per 64 bytes of pattern, [`CLASS_ITEM`] steps per
-/// Unicode or Perl class, and, when the pattern is case insensitive,
-/// [`FOLDED_LITERAL`] steps per literal character and the steps of folding
-/// every Unicode class and range. A pattern that does not parse is priced by
-/// its length: its compile stops at the parse error.
+/// [`CLASS_ITEM`] steps per Unicode or Perl class and, when the pattern is
+/// case insensitive, [`FOLDED_LITERAL`] steps per literal character and the
+/// steps of folding every Unicode class and range. A pattern that does not
+/// parse costs nothing more than [`parse_steps`]: its compile stops at the
+/// parse error.
 pub(crate) fn translation_steps(pattern: &str, cap: u64) -> u64 {
-    let mut total = COMPILE + pattern.len() as u64 / 64;
+    let mut total = 0u64;
     let Ok(ast) = ast::parse::Parser::new().parse(pattern) else {
         return total;
     };
@@ -226,7 +243,16 @@ pub(crate) fn translation_steps(pattern: &str, cap: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::translation_steps;
+    use super::{parse_steps, translation_steps};
+
+    #[test]
+    fn parsing_is_priced_per_byte() {
+        // a parse that fails at the nesting limit still parsed every byte
+        let nested = format!("{}a{}", "(".repeat(4_000), ")".repeat(4_000));
+        assert!(parse_steps(&nested) >= 10 * nested.len() as u64);
+        assert_eq!(translation_steps(&nested, u64::MAX), 0);
+        assert!(parse_steps("^/api/v[0-9]+/users/[0-9]+$") < 1_000);
+    }
 
     #[test]
     fn plain_patterns_are_cheap() {
