@@ -91,7 +91,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: Run probe benchmarks
-        run: cargo bench -p cel --bench probes -- --save-baseline pr | tee bench-probes.txt
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench -p cel --bench probes -- --save-baseline pr | tee bench-probes.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -102,10 +105,15 @@ jobs:
   dhat:
     name: Heap bounds (dhat)
     runs-on: ubuntu-latest
-    # alloc_bounds is added later; skip until the test file exists.
-    if: hashFiles('cel/tests/alloc_bounds.rs') != ''
     steps:
       - uses: actions/checkout@v4
+      # alloc_bounds is added later; skip the remaining steps until the test file exists.
+      - name: Check for alloc_bounds test
+        id: gate
+        run: |
+          if [ -f cel/tests/alloc_bounds.rs ]; then echo present=true >> "$GITHUB_OUTPUT"; fi
       - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.present == 'true'
       - name: Run allocation bound tests
+        if: steps.gate.outputs.present == 'true'
         run: cargo test -p cel --features dhat-heap --test alloc_bounds -- --test-threads=1
