@@ -1368,6 +1368,90 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn a_budget_keeps_an_env_overload_named_matches() {
+        use crate::common::functions::EvalCtx;
+        use crate::common::types::{CelBool, CelString, STRING_TYPE};
+        use crate::common::value::CowVal;
+        fn glob(this: &CelString, pattern: &CelString) -> CelBool {
+            CelBool::from(pattern.inner() == "*" || this.inner() == pattern.inner())
+        }
+        fn plain<'b, 'v>(args: Vec<CowVal<'b, 'v>>) -> Result<CowVal<'b, 'v>, ExecutionError> {
+            let string = |i: usize| args[i].downcast_ref::<CelString>().unwrap();
+            Ok(CowVal::owned(glob(string(0), string(1))))
+        }
+        fn with_env<'b, 'v>(
+            _: &EvalCtx<'_>,
+            args: Vec<CowVal<'b, 'v>>,
+        ) -> Result<CowVal<'b, 'v>, ExecutionError> {
+            plain(args)
+        }
+        // a pattern over `max_regex_len`, and one over the size limit,
+        // included: the limits are the stdlib's
+        let long = "a".repeat(576);
+        let cases = [
+            ("'abc'.matches('*')".to_owned(), true),
+            ("'abc'.matches('a.c')".to_owned(), false),
+            (r"'a'.matches(r'\w{1000}')".to_owned(), false),
+            (format!("'abc'.matches('{long}')"), false),
+            (format!("'{long}'.matches('{long}')"), true),
+        ];
+        // an embedder's `matches`, plain or Env-aware, member or global
+        type MakeEnv = fn() -> Env;
+        let envs: [(&str, MakeEnv); 4] = [
+            ("plain member", || {
+                let mut env = Env::default();
+                env.add_member_overload("matches", "m", STRING_TYPE, vec![STRING_TYPE], plain)
+                    .unwrap();
+                env
+            }),
+            ("Env-aware member", || {
+                let mut env = Env::default();
+                env.add_member_overload_with_env(
+                    "matches",
+                    "m",
+                    STRING_TYPE,
+                    vec![STRING_TYPE],
+                    with_env,
+                )
+                .unwrap();
+                env
+            }),
+            ("plain global", || {
+                let mut env = Env::default();
+                env.add_overload("matches", "m", vec![STRING_TYPE, STRING_TYPE], plain)
+                    .unwrap();
+                env
+            }),
+            ("Env-aware global", || {
+                let mut env = Env::default();
+                env.add_overload_with_env("matches", "m", vec![STRING_TYPE, STRING_TYPE], with_env)
+                    .unwrap();
+                env
+            }),
+        ];
+        for (kind, env) in envs {
+            for (src, expected) in &cases {
+                let src = match kind.ends_with("member") {
+                    true => src.clone(),
+                    // `'s'.matches('p')` as `matches('s', 'p')`
+                    false => {
+                        let (this, rest) = src.split_once(".matches(").unwrap();
+                        format!("matches({this}, {rest}")
+                    }
+                };
+                let ctx = Context::with_env(Arc::new(env()));
+                assert_eq!(
+                    same_with_and_without_budget(ctx, &src),
+                    Ok((*expected).into()),
+                    "{kind}: {}",
+                    &src[..src.len().min(24)]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn stdlib_matches_gives_the_same_results_with_a_budget() {
         for src in [
             "'abc'.matches('a.c')",

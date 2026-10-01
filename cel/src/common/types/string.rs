@@ -324,15 +324,39 @@ fn size(this: &String<'_>) -> CelInt {
     Sizer::size(this)
 }
 
+/// `string.matches(string)`. Under a budget, the frame compiles the pattern
+/// and charges it, see [`Frame::is_match`](crate::runtime::Frame::is_match).
 #[cfg(feature = "regex")]
-fn matches(this: &String<'_>, re: &String<'_>) -> Result<CelBool, ExecutionError> {
-    match regex::Regex::new(re.inner()) {
-        Ok(compiled) => Ok(CelBool::from(compiled.is_match(this.inner()))),
-        Err(err) => Err(ExecutionError::FunctionError {
-            function: "matches".to_string(),
-            message: format!("'{}' not a valid regex:\n{err}", re.inner()),
-        }),
-    }
+fn matches<'b, 'v>(
+    ectx: &crate::common::functions::EvalCtx<'_>,
+    args: Vec<CowVal<'b, 'v>>,
+) -> Result<CowVal<'b, 'v>, ExecutionError> {
+    // as the wrapper `add_member_overload!` generates
+    let string = |at: usize| {
+        let arg = args
+            .get(at)
+            .ok_or_else(|| ExecutionError::invalid_argument_count(2, args.len()))?
+            .as_ref();
+        arg.downcast_ref::<String>()
+            .ok_or_else(|| ExecutionError::UnexpectedType {
+                got: arg.get_type().name().to_owned(),
+                want: super::STRING_TYPE.name().to_owned(),
+            })
+    };
+    let (this, re) = (string(0)?, string(1)?);
+    let matched = match ectx.frame() {
+        Some(frame) => frame.is_match(this.inner(), re.inner())?,
+        None => match regex::Regex::new(re.inner()) {
+            Ok(compiled) => compiled.is_match(this.inner()),
+            Err(err) => {
+                return Err(ExecutionError::FunctionError {
+                    function: "matches".to_string(),
+                    message: format!("'{}' not a valid regex:\n{err}", re.inner()),
+                })
+            }
+        },
+    };
+    Ok(CowVal::owned(CelBool::from(matched)))
 }
 
 fn string_from_int(this: &CelInt) -> String<'static> {
@@ -402,12 +426,14 @@ pub(crate) fn stdlib(env: &mut crate::Env) {
     crate::add_member_overload!(env, fn starts_with: (String, String) -> CelBool);
     #[cfg(feature = "regex")]
     {
-        crate::add_member_overload!(env, fn matches: (String, String) -> Result<CelBool>);
-        env.mark_builtin(
+        env.add_member_overload_with_env(
             "matches",
             "string.matches(string)",
-            crate::common::decls::Builtin::StringMatches,
-        );
+            super::STRING_TYPE,
+            vec![super::STRING_TYPE],
+            matches,
+        )
+        .expect("Must be unique id");
     }
 }
 
