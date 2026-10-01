@@ -771,6 +771,121 @@ mod tests {
         assert_eq!(run(&ctx, "length([1])"), Ok(1.into()));
     }
 
+    /// Every construct that catches or short-circuits errors, with `BOOM`
+    /// standing for a sub-expression that exhausts the budget.
+    const ERROR_CATCHING_SITES: &[&str] = &[
+        "BOOM || true",
+        "false || BOOM",
+        "BOOM && false",
+        "true && BOOM",
+        "!BOOM",
+        "BOOM ? 1 : 2",
+        "true ? BOOM : false",
+        "false ? 1 : BOOM",
+        "[1].all(x, BOOM)",
+        "[1].exists(x, BOOM)",
+        "[1, 2].exists(x, x == 2 || BOOM)",
+        "[1].exists_one(x, BOOM)",
+        "size([1].filter(x, BOOM)) == 0",
+        "size([1].map(x, BOOM)) == 0",
+        "size([1].map(x, BOOM, x)) == 0",
+        "[1].all(x, [1].exists(y, BOOM)) || true",
+        "has({'a': BOOM}.a)",
+        "has({'a': {'b': BOOM}}.a.b)",
+        "{'a': BOOM}.?a.hasValue()",
+        "{'a': {'b': BOOM}}.?a.?b.hasValue()",
+        "optional.of({'a': BOOM}).a.hasValue()",
+        "[BOOM][?0].hasValue()",
+        "{'a': BOOM}[?'a'].hasValue()",
+        "{'a': 1}[?'a'].orValue(BOOM) == 1",
+        "optional.none().orValue(BOOM)",
+        "optional.of(BOOM).hasValue()",
+        "BOOM in [true]",
+        "[BOOM] == [true]",
+        "{'k': BOOM} != {}",
+    ];
+
+    /// Asserts that `boom` exhausting the budget of `ctx` fails every site
+    /// with `expected`.
+    fn assert_fatal_everywhere(ctx: &Context, boom: &str, expected: ResolveResult) {
+        for site in ERROR_CATCHING_SITES {
+            let src = site.replace("BOOM", boom);
+            assert_eq!(run_optional(ctx, &src), expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn steps_budget_is_fatal_everywhere() {
+        let mut ctx = steps_budget(2_000);
+        ctx.add_variable("l", (0..1_000i64).collect::<Vec<_>>())
+            .unwrap();
+        // the sites themselves fit the budget...
+        for site in ERROR_CATCHING_SITES {
+            let src = site.replace("BOOM", "true");
+            assert!(run_optional(&ctx, &src).is_ok(), "{src}");
+        }
+        // ...and none of them absorbs running out of it
+        assert_fatal_everywhere(&ctx, "l.all(x, true)", steps_exceeded(2_000));
+    }
+
+    #[test]
+    fn bytes_budget_is_fatal_everywhere() {
+        let ctx = bytes_budget(1_500);
+        for site in ERROR_CATCHING_SITES {
+            let src = site.replace("BOOM", "true");
+            assert!(run_optional(&ctx, &src).is_ok(), "{src}");
+        }
+        assert_fatal_everywhere(&ctx, "size(s + s) > 0", bytes_exceeded(1_500));
+    }
+
+    #[test]
+    fn iteration_budget_is_fatal_everywhere() {
+        let mut ctx = budgeted(500);
+        ctx.add_variable("l", (0..1_000i64).collect::<Vec<_>>())
+            .unwrap();
+        assert_fatal_everywhere(&ctx, "l.all(x, true)", budget_exceeded(500));
+    }
+
+    #[test]
+    fn interrupt_is_fatal_everywhere() {
+        let interrupt = || true;
+        let mut ctx = Context::default();
+        ctx.set_interrupt(&interrupt);
+        assert_fatal_everywhere(&ctx, "[1].all(x, true)", Err(ExecutionError::Interrupted));
+    }
+
+    #[test]
+    fn a_swallowed_budget_error_still_fails_the_evaluation() {
+        fn swallow(ftx: &FunctionContext) -> ResolveResult {
+            let program = Program::compile("size(s + s) > 0 && l.all(x, true)").unwrap();
+            let _ = program.execute(ftx.ptx);
+            Ok(Value::Bool(true))
+        }
+        let mut ctx = bytes_budget(1_500);
+        ctx.add_function("swallow", swallow).unwrap();
+        assert_eq!(run(&ctx, "swallow() || true"), bytes_exceeded(1_500));
+        let mut ctx = steps_budget(100);
+        ctx.add_variable("s", "x").unwrap();
+        ctx.add_variable("l", (0..1_000i64).collect::<Vec<_>>())
+            .unwrap();
+        ctx.add_function("swallow", swallow).unwrap();
+        assert_eq!(run(&ctx, "swallow() || true"), steps_exceeded(100));
+    }
+
+    #[test]
+    fn budget_exceeded_is_fatal() {
+        assert!(ExecutionError::BudgetExceeded {
+            kind: BudgetKind::Steps,
+            limit: 1
+        }
+        .is_fatal());
+        assert!(ExecutionError::BudgetExceeded {
+            kind: BudgetKind::Bytes,
+            limit: 1
+        }
+        .is_fatal());
+    }
+
     #[test]
     fn budget_exceeded_displays_its_kind() {
         let err = ExecutionError::BudgetExceeded {
