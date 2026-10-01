@@ -1949,9 +1949,7 @@ fn budgeted_matches<'b, 'v>(
 /// Charges the steps of dispatching the function `name` on `args`: one, plus
 /// one per 64 bytes of the string searched by the string functions whose cost
 /// grows with it, and for `matches`, whose cost grows with the pattern times
-/// the subject, the product of both counts. A `matches` pattern longer than
-/// [`RuntimeOptions::max_regex_len`](crate::RuntimeOptions::max_regex_len)
-/// is refused here, before it is compiled.
+/// the subject, the product of both counts.
 #[inline(always)]
 fn charge_dispatch(ctx: &Context, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
     match ctx.frame() {
@@ -1971,23 +1969,12 @@ fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), Executi
         "contains" | "startsWith" | "endsWith" => string_len(0).map_or(0, |len| len / 64 + 1),
         // a string's size counts its characters
         "size" => string_len(0).map_or(0, |len| len / 64),
-        // compiling and matching are charged by `Frame::is_match`, by the
-        // size of the compiled automaton
-        "matches" => {
-            match string_len(1) {
-                Some(pattern) => {
-                    let limit = frame.max_regex_len();
-                    if limit > 0 && pattern > limit {
-                        return Err(ExecutionError::function_error(
-                        "matches",
-                        format!("regex pattern of {pattern} bytes exceeds the limit of {limit} bytes"),
-                    ));
-                    }
-                    0
-                }
-                None => string_len(0).map_or(0, |len| len / 64 + 1),
-            }
-        }
+        // the standard library's is limited, priced and charged by
+        // `Frame::is_match`; any other `matches` prices its own work
+        "matches" => match string_len(1) {
+            Some(_) => 0,
+            None => string_len(0).map_or(0, |len| len / 64 + 1),
+        },
         _ => 0,
     };
     match frame.add_steps(1u64.saturating_add(scan)) {

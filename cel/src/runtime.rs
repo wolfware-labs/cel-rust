@@ -279,7 +279,8 @@ impl RuntimeOptions {
     /// Caps the length, in bytes, of a regular expression pattern passed to
     /// the standard library's `matches`. Longer patterns fail with an
     /// [`ExecutionError::FunctionError`](crate::ExecutionError::FunctionError)
-    /// before they are compiled.
+    /// before they are compiled. A function of your own named `matches`
+    /// is not limited.
     ///
     /// Zero, the default, means unlimited.
     pub fn with_max_regex_len(mut self, max_regex_len: u64) -> Self {
@@ -414,6 +415,7 @@ pub struct Frame<'a> {
     steps: AtomicU64,
     max_bytes: u64,
     bytes: AtomicU64,
+    #[cfg_attr(not(feature = "regex"), allow(dead_code))]
     max_regex_len: u64,
     #[cfg_attr(not(feature = "regex"), allow(dead_code))]
     regex_size_limit: u64,
@@ -477,13 +479,9 @@ impl<'a> Frame<'a> {
         usize::try_from(elements).unwrap_or(usize::MAX)
     }
 
-    /// The longest regex pattern `matches` accepts, zero meaning unlimited.
-    pub(crate) fn max_regex_len(&self) -> u64 {
-        self.max_regex_len
-    }
-
     /// Compiles `pattern` and matches it against `subject`, as `matches`
-    /// does, charging the steps the compiled automaton costs.
+    /// does, charging the steps the compiled automaton costs. A pattern
+    /// longer than [`RuntimeOptions::with_max_regex_len`] is refused first.
     ///
     /// The pattern is compiled with the same configuration as
     /// `regex::Regex::new` (so the result and the error messages are the
@@ -506,6 +504,13 @@ impl<'a> Frame<'a> {
     #[cfg(feature = "regex")]
     pub(crate) fn is_match(&self, subject: &str, pattern: &str) -> Result<bool, ExecutionError> {
         use regex_automata::{meta, util::syntax, MatchKind};
+        let (len, limit) = (pattern.len() as u64, self.max_regex_len);
+        if limit > 0 && len > limit {
+            return Err(ExecutionError::function_error(
+                "matches",
+                format!("regex pattern of {len} bytes exceeds the limit of {limit} bytes"),
+            ));
+        }
         // parsing the pattern twice, to price it and to compile it, then
         // translating it, priced from its syntax: each charged before it runs
         if !self.add_steps(crate::regex_cost::parse_steps(pattern)) {
@@ -1294,15 +1299,20 @@ mod tests {
         assert_eq!(RuntimeOptions::default().regex_size_limit(), 0);
     }
 
-    /// Runs `src` against `ctx` without a budget and with one, which must
-    /// not change the result.
+    /// Runs `src` against `ctx` without a budget and with one, with the
+    /// regex limits bb-cel sets, which must not change the result.
     #[cfg(feature = "regex")]
     fn same_with_and_without_budget(
         mut ctx: Context<'static, 'static>,
         src: &str,
     ) -> ResolveResult {
         let unbudgeted = run(&ctx, src);
-        ctx.set_budget(RuntimeOptions::default().with_max_steps(1_000_000));
+        ctx.set_budget(
+            RuntimeOptions::default()
+                .with_max_steps(1_000_000)
+                .with_max_regex_len(512)
+                .with_regex_size_limit(1 << 20),
+        );
         let budgeted = run(&ctx, src);
         assert_eq!(unbudgeted, budgeted, "{src}");
         budgeted
@@ -1311,13 +1321,23 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn a_budget_does_not_add_matches_to_an_env_without_it() {
-        let ctx = Context::with_env(Arc::new(Env::default()));
-        assert_eq!(
-            same_with_and_without_budget(ctx, "'abc'.matches('a.c')"),
-            Err(ExecutionError::UndeclaredReference(Arc::new(
-                "matches".into()
-            )))
-        );
+        // a pattern over `max_regex_len` included: the limit is the stdlib's
+        let long = "a".repeat(576);
+        for src in [
+            "'abc'.matches('a.c')".to_owned(),
+            format!("'abc'.matches('{long}')"),
+            format!("matches('abc', '{long}')"),
+        ] {
+            let ctx = Context::with_env(Arc::new(Env::default()));
+            assert_eq!(
+                same_with_and_without_budget(ctx, &src),
+                Err(ExecutionError::UndeclaredReference(Arc::new(
+                    "matches".into()
+                ))),
+                "{}",
+                &src[..24]
+            );
+        }
     }
 
     #[cfg(feature = "regex")]
@@ -1326,11 +1346,23 @@ mod tests {
         fn glob(this: crate::extractors::This<Arc<String>>, pattern: Arc<String>) -> bool {
             pattern.as_str() == "*" || this.0 == pattern
         }
-        for src in ["'abc'.matches('*')", "'abc'.matches('a.c')"] {
+        // a pattern over `max_regex_len` included: the limit is the stdlib's
+        let long = "a".repeat(576);
+        for (src, expected) in [
+            ("'abc'.matches('*')".to_owned(), true),
+            ("'abc'.matches('a.c')".to_owned(), false),
+            ("matches('abc', '*')".to_owned(), true),
+            (format!("'abc'.matches('{long}')"), false),
+            (format!("matches('abc', '{long}')"), false),
+        ] {
             let mut ctx = Context::with_env(Arc::new(Env::default()));
             ctx.add_function("matches", glob).unwrap();
-            let expected = Ok((src == "'abc'.matches('*')").into());
-            assert_eq!(same_with_and_without_budget(ctx, src), expected, "{src}");
+            assert_eq!(
+                same_with_and_without_budget(ctx, &src),
+                Ok(expected.into()),
+                "{}",
+                &src[..src.len().min(24)]
+            );
         }
     }
 
