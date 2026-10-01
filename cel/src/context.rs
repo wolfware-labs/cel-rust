@@ -63,7 +63,9 @@ pub enum Context<'p, 'v> {
         variables: BTreeMap<String, Box<dyn Val + 'v>>,
         resolver: Option<&'v dyn VariableResolver>,
         interrupt: Option<&'v dyn Interrupt>,
-        frame: Option<Frame<'v>>,
+        /// The frame of the evaluation this scope takes part in, copied into
+        /// every inner scope so that looking it up is O(1).
+        frame: Option<&'p Frame<'v>>,
     },
 }
 
@@ -192,24 +194,34 @@ impl<'p, 'v> Context<'p, 'v> {
     }
 
     /// The [`Frame`] of the evaluation this context takes part in, if any.
-    pub(crate) fn frame(&self) -> Option<&Frame<'v>> {
+    ///
+    /// This is O(1): every scope holds the frame reference itself.
+    #[inline(always)]
+    pub(crate) fn frame(&self) -> Option<&'p Frame<'v>> {
         match self {
             Context::Root { .. } => None,
-            Context::Child { frame, parent, .. } => frame.as_ref().or_else(|| parent.frame()),
+            Context::Child { frame, .. } => *frame,
         }
     }
 
-    /// Creates an inner scope carrying a fresh [`Frame`] for a new evaluation.
+    /// Creates a [`Frame`] for a new evaluation under this context, from the
+    /// limits and interrupt handle in force here.
+    pub(crate) fn new_frame(&self) -> Frame<'v> {
+        Frame::new(self.env().options(), self.interrupt())
+    }
+
+    /// Creates an inner scope evaluating within `frame`, which the caller owns
+    /// (typically on its stack) for the duration of the evaluation.
     ///
     /// Callers must check [`frame`](Self::frame) first: a nested evaluation must
     /// share the frame of the evaluation it runs within, not start its own.
-    pub(crate) fn new_frame_scope<'b>(&'b self) -> Context<'b, 'v> {
+    pub(crate) fn new_frame_scope<'b>(&'b self, frame: &'b Frame<'v>) -> Context<'b, 'v> {
         Context::Child {
             parent: self,
             variables: Default::default(),
             resolver: None,
             interrupt: None,
-            frame: Some(Frame::new(self.env().options(), self.interrupt())),
+            frame: Some(frame),
         }
     }
 
@@ -331,7 +343,7 @@ impl<'p, 'v> Context<'p, 'v> {
             variables: Default::default(),
             resolver: None,
             interrupt: None,
-            frame: None,
+            frame: self.frame(),
         }
     }
 

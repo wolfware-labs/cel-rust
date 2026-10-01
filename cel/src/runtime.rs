@@ -645,6 +645,24 @@ mod tests {
     }
 
     #[test]
+    fn every_scope_carries_the_frame_itself() {
+        // Looking the frame up must not walk the parent chain: every scope
+        // under the frame scope holds a reference to it.
+        let root = Context::default();
+        let frame = root.new_frame();
+        let scope = root.new_frame_scope(&frame);
+        let a = scope.new_inner_scope();
+        let b = a.new_inner_scope();
+        let c = b.new_inner_scope();
+        for ctx in [&scope, &a, &b, &c] {
+            match ctx {
+                Context::Child { frame: Some(f), .. } => assert!(std::ptr::eq(*f, &frame)),
+                _ => panic!("scope lost the frame"),
+            }
+        }
+    }
+
+    #[test]
     fn context_stays_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Context>();

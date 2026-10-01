@@ -1043,11 +1043,9 @@ impl Value {
         if ctx.frame().is_some() {
             return f(ctx);
         }
-        let ctx = ctx.new_frame_scope();
-        let result = f(&ctx);
-        ctx.frame()
-            .expect("frame scope carries a frame")
-            .finish(result)
+        let frame = ctx.new_frame();
+        let result = f(&ctx.new_frame_scope(&frame));
+        frame.finish(result)
     }
 
     /// Evaluates `expr` against `ctx`.
