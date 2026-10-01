@@ -1661,7 +1661,7 @@ impl<'e> AppendStep<'e> {
                     continue;
                 }
             }
-            accu.extend(Value::resolve_val(self.items, &ctx)?.as_ref())?;
+            accu.extend_owned(Value::resolve_val(self.items, &ctx)?)?;
         }
         Ok(CowVal::owned(accu.to_immutable()))
     }
@@ -2722,7 +2722,10 @@ mod tests {
     /// Strings, bytes, lists and maps are shared with the [`Value`]s they are
     /// converted from and to, not copied.
     mod sharing {
+        use crate::common::types::{Type, DYN_TYPE};
+        use crate::common::value::Val;
         use crate::{Context, Program, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
         fn execute(ctx: &Context, expr: &str) -> Value {
@@ -2738,6 +2741,51 @@ mod tests {
                 panic!("expected a string")
             };
             assert!(Arc::ptr_eq(&out, &arc));
+        }
+
+        /// A value that counts how often it is cloned.
+        #[derive(Debug)]
+        struct Counted(Arc<AtomicUsize>);
+
+        impl Val for Counted {
+            fn get_type(&self) -> &Type {
+                &DYN_TYPE
+            }
+
+            fn cel_type() -> &'static Type {
+                &DYN_TYPE
+            }
+
+            fn clone_as_boxed<'v>(&self) -> Box<dyn Val + 'v> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::new(Counted(self.0.clone()))
+            }
+        }
+
+        fn clones_of(expr: &str) -> usize {
+            let clones = Arc::new(AtomicUsize::new(0));
+            let mut ctx = Context::default();
+            ctx.add_variable_as_val("v", Box::new(Counted(clones.clone())));
+            let program = Program::compile(expr).unwrap();
+            let size = match program.execute(&ctx) {
+                Ok(Value::Int(size)) => size,
+                other => panic!("expected the size, got {other:?}"),
+            };
+            assert_eq!(size, 3);
+            clones.load(Ordering::Relaxed)
+        }
+
+        #[test]
+        fn map_moves_the_built_elements() {
+            // one clone per iteration, to build `[v]`; appending it moves it
+            assert_eq!(clones_of("size([1, 2, 3].map(x, v))"), 3);
+        }
+
+        #[test]
+        fn filter_moves_the_built_elements() {
+            // `[v, v, v]` clones `v` 3 times, binding `x` and building `[x]` once
+            // per iteration each; appending `[x]` moves it
+            assert_eq!(clones_of("size([v, v, v].filter(x, true))"), 9);
         }
 
         #[test]

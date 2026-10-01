@@ -309,7 +309,9 @@ impl<'b, 'v: 'w, 'w> traits::Iterator<'b, 'w> for SliceIterator<'b, 'v> {
 ///
 /// It is deliberately not a [`Val`]: the evaluator owns it for the duration
 /// of the loop and never binds it to a variable, so no expression can observe
-/// it half-built. Appending goes through [`MutableList::extend`] rather than
+/// it half-built. Appending goes through [`MutableList::extend_owned`], which
+/// moves the elements of a freshly built list in, or [`MutableList::extend`],
+/// rather than
 /// [`Adder`], because growing the list in place is only sound for elements
 /// that live as long as the list does (`'v`), which the generic
 /// `Adder::add<'b, 'w>` cannot express. When the loop completes, the
@@ -337,6 +339,26 @@ impl<'v> MutableList<'v> {
             self.0.push(item.clone_as_boxed());
         }
         Ok(())
+    }
+
+    /// Appends every element of `rhs`, which must be a list: moved out of it
+    /// when it is owned, copied when it is borrowed.
+    ///
+    /// This is what a `map` / `filter` step appends: a freshly built `[expr]`
+    /// list that nothing else holds, whose elements need not be copied.
+    pub fn extend_owned(&mut self, rhs: CowVal<'_, 'v>) -> Result<(), ExecutionError> {
+        match rhs {
+            CowVal::Owned(b) => match super::into_builtin(b) {
+                Ok(Builtin::List(list)) => {
+                    // a move unless another clone of the list is still alive
+                    self.0.extend(list.into_inner());
+                    Ok(())
+                }
+                Ok(other) => self.extend(other.into_boxed().as_ref()),
+                Err(b) => self.extend(b.as_ref()),
+            },
+            CowVal::Borrowed(v) => self.extend(v),
+        }
     }
 
     /// Converts the mutable list into an immutable [`DefaultList`], reusing
@@ -623,6 +645,55 @@ pub mod tests {
         let imm = m.to_immutable();
         let s = imm.inner()[0].downcast_ref::<CelString>().unwrap();
         assert!(std::ptr::eq(s.inner(), owned.as_str()));
+    }
+
+    fn addr(v: &dyn Val) -> *const () {
+        v as *const dyn Val as *const ()
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_moves_the_elements() {
+        let item = box_val(CelString::from(String::from("cel")));
+        let item_addr = addr(item.as_ref());
+        let mut m = MutableList::with_capacity(1);
+        m.extend_owned(CowVal::owned(DefaultList::from(vec![item])))
+            .unwrap();
+        let imm = m.to_immutable();
+        assert_eq!(imm.inner().len(), 1);
+        assert_eq!(addr(imm.inner()[0].as_ref()), item_addr);
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_copies_a_borrowed_list() {
+        let rhs = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let mut m = MutableList::with_capacity(1);
+        m.extend_owned(CowVal::Borrowed(&rhs)).unwrap();
+        let imm = m.to_immutable();
+        assert_eq!(imm.inner().len(), 1);
+        assert_ne!(addr(imm.inner()[0].as_ref()), addr(rhs.inner()[0].as_ref()));
+        assert_eq!(rhs.inner().len(), 1);
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_copies_a_shared_list() {
+        let rhs = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let shared = rhs.clone();
+        let mut m = MutableList::with_capacity(1);
+        m.extend_owned(CowVal::owned(rhs)).unwrap();
+        assert_eq!(m.len_for_test(), 1);
+        assert_eq!(shared.inner().len(), 1);
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_requires_a_list() {
+        let mut m = MutableList::with_capacity(0);
+        assert_eq!(
+            m.extend_owned(CowVal::owned(CelInt::from(1i64))),
+            Err(ExecutionError::UnexpectedType {
+                got: "int".to_owned(),
+                want: "iterable".to_owned(),
+            })
+        );
     }
 
     #[test]
