@@ -336,6 +336,45 @@ mod tests {
     }
 
     #[test]
+    fn map_and_filter_are_budgeted() {
+        // `map` and `filter` run through a dedicated append loop, which must
+        // spend the budget like any other comprehension.
+        let ctx = budgeted(6);
+        assert_eq!(
+            run(&ctx, "[1, 2, 3, 4, 5, 6].map(x, x)"),
+            Ok(vec![1, 2, 3, 4, 5, 6].into())
+        );
+        let ctx = budgeted(5);
+        assert_eq!(
+            run(&ctx, "[1, 2, 3, 4, 5, 6].map(x, x)"),
+            budget_exceeded(5)
+        );
+        assert_eq!(
+            run(&ctx, "[1, 2, 3, 4, 5, 6].filter(x, x > 0)"),
+            budget_exceeded(5)
+        );
+        assert_eq!(
+            run(&ctx, "[1, 2, 3, 4, 5, 6].map(x, x > 0, x)"),
+            budget_exceeded(5)
+        );
+    }
+
+    #[test]
+    fn map_and_filter_are_interruptible() {
+        let interrupt = || true;
+        let mut ctx = Context::default();
+        ctx.set_interrupt(&interrupt);
+        assert_eq!(
+            run(&ctx, "[1, 2].map(x, x)"),
+            Err(ExecutionError::Interrupted)
+        );
+        assert_eq!(
+            run(&ctx, "[1, 2].filter(x, true)"),
+            Err(ExecutionError::Interrupted)
+        );
+    }
+
+    #[test]
     fn budget_is_global_across_nested_comprehensions() {
         // 2 outer + 2 * 2 inner = 6 iterations
         let ctx = budgeted(6);

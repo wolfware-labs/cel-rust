@@ -1695,6 +1695,7 @@ impl<'e> AppendStep<'e> {
             .unwrap_or(0);
         let mut accu = MutableList::with_capacity(size_hint);
 
+        let frame = ctx.frame();
         let mut ctx = ctx.new_inner_scope();
         let mut items = iter
             .as_iterable()
@@ -1704,6 +1705,9 @@ impl<'e> AppendStep<'e> {
             })?
             .iter();
         while let Some(item) = items.next() {
+            if let Some(frame) = frame {
+                frame.tick()?;
+            }
             if !try_bool(Value::resolve_val(&comprehension.loop_cond, &ctx))? {
                 break;
             }
