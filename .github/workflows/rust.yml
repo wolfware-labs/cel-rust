@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master", "bunnybox/**", "fix/**", "feat/**", "perf/**"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master", "bunnybox/**", "fix/**", "feat/**", "perf/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -83,3 +83,29 @@ jobs:
         # Build, don't run since it starts an HTTP server
       - name: Run example-axum
         run: cargo build --bin example-axum --manifest-path example/Cargo.toml --features axum
+  bench-guard:
+    name: Bench guard (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run probe benchmarks
+        run: cargo bench -p cel --bench probes -- --save-baseline pr | tee bench-probes.txt
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-probes
+          path: |
+            bench-probes.txt
+            target/criterion
+  dhat:
+    name: Heap bounds (dhat)
+    runs-on: ubuntu-latest
+    # alloc_bounds is added later; skip until the test file exists.
+    if: hashFiles('cel/tests/alloc_bounds.rs') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run allocation bound tests
+        run: cargo test -p cel --features dhat-heap --test alloc_bounds -- --test-threads=1

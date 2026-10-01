@@ -13,6 +13,7 @@ jobs:
 
   # Release unpublished packages.
   release-plz-release:
+    if: github.repository == 'cel-rust/cel-rust'
     name: Release-plz release
     runs-on: ubuntu-latest
     steps:
@@ -30,6 +31,7 @@ jobs:
 
   # Create a PR with the new versions and changelog, preparing the next release.
   release-plz-pr:
+    if: github.repository == 'cel-rust/cel-rust'
     name: Release-plz PR
     runs-on: ubuntu-latest
     concurrency:
