@@ -1,20 +1,30 @@
-//! Per-evaluation runtime state: cooperative interruption and iteration budgets.
+//! Per-evaluation runtime state: cooperative interruption and budgets.
 //!
-//! Evaluation of a CEL expression is bounded by two independent mechanisms:
+//! Evaluation of a CEL expression is bounded by independent mechanisms:
 //!
 //! - an [`Interrupt`] handle, set per evaluation on the [`Context`](crate::Context)
 //!   with [`Context::set_interrupt`](crate::Context::set_interrupt), that the
 //!   interpreter polls while iterating comprehensions (`all`, `exists`, `map`,
 //!   `filter`, ...);
-//! - an iteration budget, configured on the [`Env`](crate::Env) through
-//!   [`RuntimeOptions`], that caps the total number of comprehension iterations
-//!   performed by a single evaluation, nested comprehensions included.
+//! - budgets, set through [`RuntimeOptions`] on the [`Env`](crate::Env) or,
+//!   per context, with [`Context::set_budget`](crate::Context::set_budget):
+//!   - an iteration budget capping the comprehension iterations of a single
+//!     evaluation, nested comprehensions included;
+//!   - a steps budget capping the expression nodes evaluated and functions
+//!     dispatched, with data-proportional charges for operations that walk
+//!     their operands;
+//!   - a bytes budget capping the bytes allocated for the values created.
 //!
-//! When either trips, evaluation aborts with
-//! [`ExecutionError::Interrupted`](crate::ExecutionError::Interrupted) or
-//! [`ExecutionError::IterationBudgetExceeded`](crate::ExecutionError::IterationBudgetExceeded).
-//! Unlike ordinary CEL errors, these are never absorbed by `||`, `&&`, or
-//! optional accessors: once tripped, the evaluation as a whole fails.
+//! When one trips, evaluation aborts with
+//! [`ExecutionError::Interrupted`](crate::ExecutionError::Interrupted),
+//! [`ExecutionError::IterationBudgetExceeded`](crate::ExecutionError::IterationBudgetExceeded) or
+//! [`ExecutionError::BudgetExceeded`](crate::ExecutionError::BudgetExceeded).
+//! Unlike ordinary CEL errors, these are never absorbed by `||`, `&&`,
+//! comprehension macros or optional accessors: once tripped, the evaluation as
+//! a whole fails.
+//!
+//! An evaluation with no budget and no interrupt handle does none of this
+//! bookkeeping.
 
 use crate::common::value::{BuiltinRef, Val};
 use crate::ExecutionError;
@@ -240,6 +250,11 @@ impl RuntimeOptions {
     /// The bytes budget, zero meaning unlimited.
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// Whether these options set no budget of any kind.
+    pub(crate) fn is_unbounded(&self) -> bool {
+        self.max_iterations == 0 && self.max_steps == 0 && self.max_bytes == 0
     }
 }
 
@@ -887,6 +902,58 @@ mod tests {
     }
 
     #[test]
+    fn context_budget_overrides_the_env() {
+        // the env sets no budget: the context's applies
+        let mut ctx = Context::default();
+        ctx.set_budget(RuntimeOptions::default().with_max_steps(2));
+        assert_eq!(run(&ctx, "1 + 1"), steps_exceeded(2));
+        // the env sets one: the context's replaces it
+        let mut ctx = steps_budget(2);
+        ctx.set_budget(RuntimeOptions::default().with_max_steps(3));
+        assert_eq!(run(&ctx, "1 + 1"), Ok(2.into()));
+        ctx.set_budget(RuntimeOptions::default());
+        assert_eq!(run(&ctx, "1 + 1 + 1 + 1"), Ok(4.into()));
+    }
+
+    #[test]
+    fn nearest_scope_budget_applies() {
+        let mut root = Context::default();
+        root.set_budget(RuntimeOptions::default().with_max_steps(2));
+        let mut child = root.new_inner_scope();
+        assert_eq!(run(&child, "1 + 1"), steps_exceeded(2));
+        child.set_budget(RuntimeOptions::default().with_max_steps(3));
+        assert_eq!(run(&child, "1 + 1"), Ok(2.into()));
+        assert_eq!(run(&root, "1 + 1"), steps_exceeded(2));
+    }
+
+    #[test]
+    fn contexts_sharing_an_env_vary_their_budgets() {
+        let env = Arc::new(Env::stdlib());
+        let mut tight = Context::with_env(env.clone());
+        tight.set_budget(RuntimeOptions::default().with_max_bytes(10));
+        let loose = Context::with_env(env);
+        assert_eq!(run(&tight, "size('abc' + 'defghijkl')"), bytes_exceeded(10));
+        assert_eq!(run(&loose, "size('abc' + 'defghijkl')"), Ok(12.into()));
+    }
+
+    #[test]
+    fn unbounded_evaluation_creates_no_frame() {
+        fn has_frame(ftx: &FunctionContext) -> ResolveResult {
+            Ok(Value::Bool(ftx.ptx.frame().is_some()))
+        }
+        let mut ctx = Context::default();
+        ctx.add_function("hasFrame", has_frame).unwrap();
+        assert_eq!(run(&ctx, "hasFrame()"), Ok(false.into()));
+        ctx.set_budget(RuntimeOptions::default().with_max_steps(100));
+        assert_eq!(run(&ctx, "hasFrame()"), Ok(true.into()));
+        let interrupt = || false;
+        let mut ctx = Context::default();
+        ctx.add_function("hasFrame", has_frame).unwrap();
+        ctx.set_interrupt(&interrupt);
+        assert_eq!(run(&ctx, "hasFrame()"), Ok(true.into()));
+    }
+
+    #[test]
     fn budget_exceeded_displays_its_kind() {
         let err = ExecutionError::BudgetExceeded {
             kind: BudgetKind::Steps,
@@ -1237,8 +1304,10 @@ mod tests {
     fn every_scope_carries_the_frame_itself() {
         // Looking the frame up must not walk the parent chain: every scope
         // under the frame scope holds a reference to it.
-        let root = Context::default();
-        let frame = root.new_frame();
+        let interrupt = || false;
+        let mut root = Context::default();
+        root.set_interrupt(&interrupt);
+        let frame = root.new_frame().expect("an interrupt needs a frame");
         let scope = root.new_frame_scope(&frame);
         let a = scope.new_inner_scope();
         let b = a.new_inner_scope();

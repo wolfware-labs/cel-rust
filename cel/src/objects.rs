@@ -1050,9 +1050,14 @@ impl Value {
         if ctx.frame().is_some() {
             return f(ctx);
         }
-        let frame = ctx.new_frame();
-        let result = f(&ctx.new_frame_scope(&frame));
-        frame.finish(result)
+        match ctx.new_frame() {
+            // nothing to enforce: no frame, and no per-node work beyond a check
+            None => f(ctx),
+            Some(frame) => {
+                let result = f(&ctx.new_frame_scope(&frame));
+                frame.finish(result)
+            }
+        }
     }
 
     /// Evaluates `expr` against `ctx`.
