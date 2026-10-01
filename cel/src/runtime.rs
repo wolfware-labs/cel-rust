@@ -196,8 +196,10 @@ impl RuntimeOptions {
     /// operands are charged in proportion: `in` on a list and `==`/`!=` on
     /// lists or maps cost one step per element walked, the string
     /// functions `contains`, `startsWith` and `endsWith` one step per 64
-    /// bytes of the string searched, and `matches` the product of the
-    /// pattern's and the subject's 64-byte counts, charged before matching.
+    /// bytes of the string searched, and the standard library's `matches`
+    /// by its pattern (parsing, translating and compiling it, priced before
+    /// each runs) and by the size of its compiled automaton times the
+    /// subject's length, charged before matching.
     /// Comparisons (`==`, `!=`, `in`) are charged by a walk of their
     /// operands, one step per element and per 64 bytes of string. Creating a
     /// value costs one step per element or entry, or per 64 bytes of a string
@@ -206,6 +208,16 @@ impl RuntimeOptions {
     /// [`Value`](crate::Value). Comprehension iterations are
     /// charged through the nodes they evaluate, so a steps budget bounds them
     /// too, nested ones included.
+    ///
+    /// A function you add, with [`Context::add_function`](crate::Context::add_function),
+    /// [`Env::add_overload`](crate::Env::add_overload) or
+    /// [`Env::add_member_overload`](crate::Env::add_member_overload), is
+    /// charged one dispatch step and the conversion of its arguments and
+    /// result: the budget does not see the work it does, so it must bound
+    /// that itself. This holds for a function of your own named `matches`
+    /// too: only the standard library's `string.matches(string)` is priced
+    /// by its pattern, and limited by [`with_max_regex_len`](Self::with_max_regex_len)
+    /// and [`with_regex_size_limit`](Self::with_regex_size_limit).
     ///
     /// When exceeded, evaluation fails with
     /// [`ExecutionError::BudgetExceeded`](crate::ExecutionError::BudgetExceeded)
@@ -265,7 +277,7 @@ impl RuntimeOptions {
     }
 
     /// Caps the length, in bytes, of a regular expression pattern passed to
-    /// `matches`. Longer patterns fail with an
+    /// the standard library's `matches`. Longer patterns fail with an
     /// [`ExecutionError::FunctionError`](crate::ExecutionError::FunctionError)
     /// before they are compiled.
     ///
