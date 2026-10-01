@@ -194,7 +194,13 @@ impl RuntimeOptions {
     /// lists or maps cost one step per element walked, the string
     /// functions `contains`, `startsWith` and `endsWith` one step per 64
     /// bytes of the string searched, and `matches` the product of the
-    /// pattern's and the subject's 64-byte counts, charged before matching. Comprehension iterations are
+    /// pattern's and the subject's 64-byte counts, charged before matching.
+    /// Comparisons (`==`, `!=`, `in`) are charged by a walk of their
+    /// operands, one step per element and per 64 bytes of string. Creating a
+    /// value costs one step per element or entry, or per 64 bytes of a string
+    /// (so concatenation and conversions are priced by their result), and so
+    /// does converting the result, or a custom function's argument, into a
+    /// [`Value`](crate::Value). Comprehension iterations are
     /// charged through the nodes they evaluate, so a steps budget bounds them
     /// too, nested ones included.
     ///
@@ -465,11 +471,11 @@ impl<'a> Frame<'a> {
         self.abort.load(Ordering::Relaxed) == ABORT_NONE
     }
 
-    /// Charges the bytes of creating `value`, see [`fresh_size`] and
-    /// [`add_bytes`](Self::add_bytes).
+    /// Charges the bytes and the steps of creating `value`, see
+    /// [`fresh_size`], [`fresh_steps`] and [`add_bytes`](Self::add_bytes).
     #[inline(never)]
     pub(crate) fn add_fresh(&self, value: &dyn Val) -> bool {
-        self.add_bytes(fresh_size(value))
+        self.add_bytes(fresh_size(value)) && self.add_steps(fresh_steps(value))
     }
 
     /// Charges the bytes of copying `value`, see [`clone_size`] and
@@ -491,32 +497,25 @@ impl<'a> Frame<'a> {
             .expect("a stopped evaluation has an abort")
     }
 
-    /// Charges `steps` evaluation steps, failing as [`step`](Self::step) does.
-    pub(crate) fn charge_steps(&self, steps: u64) -> Result<(), ExecutionError> {
-        match self.add_steps(steps) {
-            true => Ok(()),
-            false => Err(self.exceeded()),
-        }
-    }
-
-    /// Charges `bytes` allocated bytes, failing as [`add_bytes`](Self::add_bytes) does.
-    pub(crate) fn charge_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
-        match self.add_bytes(bytes) {
-            true => Ok(()),
-            false => Err(self.exceeded()),
-        }
-    }
-
-    /// Charges the bytes of converting `value` into a [`Value`](crate::Value),
-    /// see [`conversion_size`]. The walk stops once it passes the budget left,
-    /// so a value sharing a large one many times is refused before it is
-    /// converted, not after.
+    /// Charges the bytes and steps of converting `value` into a
+    /// [`Value`](crate::Value), see [`conversion_cost`]. The walk stops once it
+    /// passes the bytes or the steps left, so a value sharing a large one many
+    /// times is refused before it is converted, not after.
     pub(crate) fn charge_conversion(&self, value: &dyn Val) -> Result<(), ExecutionError> {
-        let cap = match self.max_bytes {
+        let cost = conversion_cost(value, self.bytes_left(), self.steps_left());
+        match self.add_bytes(cost.bytes) && self.add_steps(cost.steps) {
+            true => Ok(()),
+            false => Err(self.exceeded()),
+        }
+    }
+
+    /// The bytes left before the bytes budget is exceeded, `u64::MAX` when
+    /// there is none.
+    pub(crate) fn bytes_left(&self) -> u64 {
+        match self.max_bytes {
             0 => u64::MAX,
             max => max.saturating_sub(self.bytes.load(Ordering::Relaxed)),
-        };
-        self.charge_bytes(conversion_size(value, cap))
+        }
     }
 
     /// Polls the interrupt handle directly, bypassing the frequency gate.
@@ -675,51 +674,77 @@ pub(crate) fn compare_size(value: &dyn Val, cap: u64) -> u64 {
     total
 }
 
-/// The bytes converting `value` into a [`Value`](crate::Value) allocates,
-/// stopping once the count passes `cap`.
+/// The cost of converting a value into a [`Value`](crate::Value): the bytes
+/// it allocates and the steps it takes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cost {
+    pub(crate) bytes: u64,
+    pub(crate) steps: u64,
+}
+
+/// The cost of converting `value` into a [`Value`](crate::Value), stopping
+/// once either count passes its cap.
 ///
-/// The conversion rebuilds every list and map ([`VALUE_SLOT`] per list
-/// element, [`MAP_SLOT`] per map entry) and copies borrowed strings and bytes,
+/// The conversion rebuilds every list and map ([`VALUE_SLOT`] bytes and one
+/// step per list element, [`MAP_SLOT`] bytes and one step per map entry) and
+/// copies borrowed strings and bytes (their length in bytes, one step per 64),
 /// while shared ones are not copied. It visits a value shared `n` times `n`
-/// times, which is why the walk is capped: it runs before the conversion.
-pub(crate) fn conversion_size(value: &dyn Val, cap: u64) -> u64 {
-    fn walk(value: &dyn Val, cap: u64, total: &mut u64) {
-        if *total > cap {
+/// times, which is why the walk is capped: it runs before the conversion, and
+/// stops once the conversion would exceed the budget left.
+pub(crate) fn conversion_cost(value: &dyn Val, bytes_cap: u64, steps_cap: u64) -> Cost {
+    fn walk(value: &dyn Val, caps: &Cost, total: &mut Cost) {
+        let over = |total: &Cost| total.bytes > caps.bytes || total.steps > caps.steps;
+        if over(total) {
             return;
         }
         match value.as_builtin() {
-            BuiltinRef::String(s) if s.as_arc().is_none() => *total += s.inner().len() as u64,
-            BuiltinRef::Bytes(b) if b.as_arc().is_none() => *total += b.inner().len() as u64,
+            BuiltinRef::String(s) if s.as_arc().is_none() => {
+                let len = s.inner().len() as u64;
+                total.bytes += len;
+                total.steps += len / 64;
+            }
+            BuiltinRef::Bytes(b) if b.as_arc().is_none() => {
+                let len = b.inner().len() as u64;
+                total.bytes += len;
+                total.steps += len / 64;
+            }
             BuiltinRef::List(l) => {
-                *total += l.inner().len() as u64 * VALUE_SLOT;
+                let len = l.inner().len() as u64;
+                total.bytes += len * VALUE_SLOT;
+                total.steps += len;
                 for item in l.inner() {
-                    walk(item.as_ref(), cap, total);
-                    if *total > cap {
+                    walk(item.as_ref(), caps, total);
+                    if over(total) {
                         return;
                     }
                 }
             }
             BuiltinRef::Map(m) => {
-                *total += m.inner().len() as u64 * MAP_SLOT;
+                let len = m.inner().len() as u64;
+                total.bytes += len * MAP_SLOT;
+                total.steps += len;
                 for item in m.inner().values() {
-                    walk(item.as_ref(), cap, total);
-                    if *total > cap {
+                    walk(item.as_ref(), caps, total);
+                    if over(total) {
                         return;
                     }
                 }
             }
             BuiltinRef::Optional(o) => {
-                *total += OPTIONAL_SLOT;
+                total.bytes += OPTIONAL_SLOT;
+                total.steps += 1;
                 if let Some(inner) = o.option() {
-                    walk(inner, cap, total);
+                    walk(inner, caps, total);
                 }
             }
             #[cfg(feature = "structs")]
             BuiltinRef::Struct(s) => {
-                *total += s.field_count() as u64 * MAP_SLOT;
+                let len = s.field_count() as u64;
+                total.bytes += len * MAP_SLOT;
+                total.steps += len;
                 for item in s.fields() {
-                    walk(item, cap, total);
-                    if *total > cap {
+                    walk(item, caps, total);
+                    if over(total) {
                         return;
                     }
                 }
@@ -727,9 +752,28 @@ pub(crate) fn conversion_size(value: &dyn Val, cap: u64) -> u64 {
             _ => {}
         }
     }
-    let mut total = 0;
-    walk(value, cap, &mut total);
+    let caps = Cost {
+        bytes: bytes_cap,
+        steps: steps_cap,
+    };
+    let mut total = Cost::default();
+    walk(value, &caps, &mut total);
     total
+}
+
+/// The steps creating `value` took, beyond the node that created it: one per
+/// list element or map entry and one per 64 bytes of a string or bytes value,
+/// copied into it. Concatenation and conversions are priced by their result.
+pub(crate) fn fresh_steps(value: &dyn Val) -> u64 {
+    match value.as_builtin() {
+        BuiltinRef::String(s) => s.inner().len() as u64 / 64,
+        BuiltinRef::Bytes(b) => b.inner().len() as u64 / 64,
+        BuiltinRef::List(l) => l.inner().len() as u64,
+        BuiltinRef::Map(m) => m.inner().len() as u64,
+        #[cfg(feature = "structs")]
+        BuiltinRef::Struct(s) => s.field_count() as u64,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -928,6 +972,33 @@ mod tests {
         }
         // small comparisons stay cheap
         assert_eq!(run(&ctx, "[1, 2] == [1, 2] && 'k1' in m"), Ok(true.into()));
+    }
+
+    #[test]
+    fn steps_budget_alone_bounds_creation_and_conversion() {
+        // Without a bytes budget, the steps budget must still price work that
+        // grows with the data: concatenation copies every element, and the
+        // result conversion visits every node.
+        let mut ctx = steps_budget(10_000);
+        ctx.add_variable("l", (0..2_000i64).collect::<Vec<_>>())
+            .unwrap();
+        ctx.add_variable("s", "a".repeat(8 * 1024)).unwrap();
+        for src in [
+            "size(l.map(x, l + l)) > 0",
+            "l.map(x, l)",
+            "size([1, 2].map(x, l + l + l + l + l + l)) > 0",
+            "size([1, 2, 3].map(x, s + s + s + s + s + s + s + s + s + s)) > 0",
+            "[1, 2, 3, 4, 5, 6].map(k, l)",
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(run(&ctx, src), steps_exceeded(10_000), "{src}");
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "{src} took {:?}",
+                started.elapsed()
+            );
+        }
+        assert_eq!(run(&ctx, "size(l + l)"), Ok(4_000.into()));
     }
 
     fn bytes_budget(max_bytes: u64) -> Context<'static, 'static> {
