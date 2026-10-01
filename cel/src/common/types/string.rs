@@ -6,27 +6,49 @@ use crate::common::value::{Builtin, BuiltinRef, CowVal, Val};
 use crate::ExecutionError;
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::fmt::{Debug, Formatter};
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::string::String as StdString;
 use std::sync::Arc;
 
-/// A CEL string. Owns its bytes, or borrows them for `'a`.
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct String<'a>(Cow<'a, str>);
+/// A CEL string. Shares its bytes, or borrows them for `'a`.
+///
+/// An owned string is held in an [`Arc`], so cloning one is O(1) whether it
+/// is owned or borrowed, and converting to and from
+/// [`Value::String`](crate::Value::String) shares the buffer.
+#[derive(Clone)]
+pub struct String<'a>(Repr<'a>);
+
+#[derive(Clone)]
+enum Repr<'a> {
+    Borrowed(&'a str),
+    Shared(Arc<StdString>),
+}
 
 impl<'a> String<'a> {
-    /// The string, copied out if it was borrowed.
+    /// The string, moved out when it is owned and not shared, copied
+    /// otherwise.
     pub fn into_inner(self) -> StdString {
-        self.0.into_owned()
+        match self.0 {
+            Repr::Borrowed(s) => s.to_owned(),
+            Repr::Shared(s) => Arc::unwrap_or_clone(s),
+        }
     }
 
     pub fn inner(&self) -> &str {
-        &self.0
+        match &self.0 {
+            Repr::Borrowed(s) => s,
+            Repr::Shared(s) => s.as_str(),
+        }
     }
 
     /// Copies the bytes out if they were borrowed, so the result owns them.
     pub fn into_static(self) -> String<'static> {
-        String(Cow::Owned(self.0.into_owned()))
+        match self.0 {
+            Repr::Borrowed(s) => String::from(s.to_owned()),
+            Repr::Shared(s) => String(Repr::Shared(s)),
+        }
     }
 
     /// The bytes, with the lifetime of the borrow itself, if they are borrowed
@@ -38,13 +60,73 @@ impl<'a> String<'a> {
     /// re-borrowed, without a copy, for as long as the container's own data.
     pub fn as_borrowed(&self) -> Option<&'a str> {
         match &self.0 {
-            Cow::Borrowed(s) => Some(s),
-            Cow::Owned(_) => None,
+            Repr::Borrowed(s) => Some(s),
+            Repr::Shared(_) => None,
+        }
+    }
+
+    /// The shared buffer, if the string is owned rather than borrowed.
+    ///
+    /// Cloning the `Arc` hands the string out without copying it.
+    pub fn as_arc(&self) -> Option<&Arc<StdString>> {
+        match &self.0 {
+            Repr::Borrowed(_) => None,
+            Repr::Shared(s) => Some(s),
+        }
+    }
+
+    /// The string as an `Arc`: the shared buffer when owned, a copy when
+    /// borrowed.
+    pub(crate) fn to_arc(&self) -> Arc<StdString> {
+        match &self.0 {
+            Repr::Borrowed(s) => Arc::new((*s).to_owned()),
+            Repr::Shared(s) => Arc::clone(s),
         }
     }
 
     pub(crate) fn into_cow(self) -> Cow<'a, str> {
-        self.0
+        match self.0 {
+            Repr::Borrowed(s) => Cow::Borrowed(s),
+            Repr::Shared(s) => Cow::Owned(Arc::unwrap_or_clone(s)),
+        }
+    }
+}
+
+impl Default for String<'_> {
+    fn default() -> Self {
+        String(Repr::Borrowed(""))
+    }
+}
+
+impl Debug for String<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("String").field(&self.inner()).finish()
+    }
+}
+
+impl PartialEq for String<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner() == other.inner()
+    }
+}
+
+impl Eq for String<'_> {}
+
+impl PartialOrd for String<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for String<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.inner().cmp(other.inner())
+    }
+}
+
+impl Hash for String<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner().hash(state)
     }
 }
 
@@ -87,7 +169,7 @@ impl<'a> Val for String<'a> {
     fn equals(&self, other: &dyn Val) -> bool {
         other
             .downcast_ref::<String>()
-            .is_some_and(|other| self.0 == other.0)
+            .is_some_and(|other| self.inner() == other.inner())
     }
 
     fn clone_as_boxed<'v>(&self) -> Box<dyn Val + 'v>
@@ -118,9 +200,9 @@ impl<'a> Adder for String<'a> {
         Self: 'v,
     {
         if let Some(rhs) = rhs.downcast_ref::<String>() {
-            let mut s = StdString::with_capacity(rhs.0.len() + self.0.len());
-            s.push_str(&self.0);
-            s.push_str(&rhs.0);
+            let mut s = StdString::with_capacity(rhs.len() + self.len());
+            s.push_str(self);
+            s.push_str(rhs);
             Ok(CowVal::owned(String::from(s)))
         } else {
             Err(ExecutionError::UnsupportedBinaryOperator(
@@ -135,7 +217,7 @@ impl<'a> Adder for String<'a> {
 impl Comparer for String<'_> {
     fn compare(&self, rhs: &dyn Val) -> Result<Ordering, ExecutionError> {
         if let Some(rhs) = rhs.downcast_ref::<String>() {
-            Ok(self.0.cmp(&rhs.0))
+            Ok(self.inner().cmp(rhs.inner()))
         } else {
             Err(ExecutionError::values_not_comparable(self, rhs))
         }
@@ -156,7 +238,7 @@ impl Zeroer for String<'_> {
 
 impl From<StdString> for String<'_> {
     fn from(v: StdString) -> Self {
-        Self(Cow::Owned(v))
+        Self(Repr::Shared(Arc::new(v)))
     }
 }
 
@@ -169,22 +251,23 @@ impl From<String<'_>> for StdString {
 /// Borrows the `str`: no copy is made.
 impl<'a> From<&'a str> for String<'a> {
     fn from(value: &'a str) -> Self {
-        Self(Cow::Borrowed(value))
+        Self(Repr::Borrowed(value))
     }
 }
 
+/// Shares the buffer: no copy is made.
 impl From<Arc<StdString>> for String<'_> {
     fn from(v: Arc<StdString>) -> Self {
-        match Arc::try_unwrap(v) {
-            Ok(s) => Self(Cow::Owned(s)),
-            Err(v) => Self(Cow::Owned((*v).clone())),
-        }
+        Self(Repr::Shared(v))
     }
 }
 
 impl<'a> From<Cow<'a, str>> for String<'a> {
     fn from(value: Cow<'a, str>) -> Self {
-        Self(value)
+        match value {
+            Cow::Borrowed(s) => Self::from(s),
+            Cow::Owned(s) => Self::from(s),
+        }
     }
 }
 
@@ -208,8 +291,9 @@ impl<'a, 'v> TryFrom<&'a (dyn Val + 'v)> for &'a str {
     }
 }
 
-/// Takes the string out of `arg`: a move for an owned box, a cheap clone of
-/// the `Cow` for a borrowed one. Hands `arg` back when it is not a string.
+/// Takes the string out of `arg`: a move for an owned box, an O(1) clone (of
+/// the borrow or of the shared `Arc`) for a borrowed one. Hands `arg` back
+/// when it is not a string.
 pub(crate) fn take_string<'b, 'v>(arg: CowVal<'b, 'v>) -> Result<String<'v>, CowVal<'b, 'v>> {
     match arg {
         CowVal::Borrowed(v) => v
@@ -325,6 +409,7 @@ mod tests {
     use super::StdString;
     use super::String;
     use crate::common::value::{CowVal, Val};
+    use std::sync::Arc;
 
     #[test]
     fn as_borrowed_outlives_the_string() {
@@ -340,6 +425,42 @@ mod tests {
             owned[3..].as_ptr()
         ));
         assert_eq!(String::from(StdString::from("owned")).as_borrowed(), None);
+    }
+
+    #[test]
+    fn clone_is_shallow() {
+        let s = String::from(StdString::from("cel-rust"));
+        let cloned = s.clone();
+        assert!(std::ptr::eq(s.inner(), cloned.inner()));
+        let boxed = s.clone_as_boxed();
+        let back = boxed.downcast_ref::<String>().unwrap();
+        assert!(std::ptr::eq(s.inner(), back.inner()));
+    }
+
+    #[test]
+    fn from_a_shared_arc_shares_it() {
+        let arc = Arc::new(StdString::from("cel-rust"));
+        let s = String::from(arc.clone());
+        assert!(std::ptr::eq(s.inner(), arc.as_str()));
+        assert!(std::ptr::eq(s.clone().into_static().inner(), arc.as_str()));
+    }
+
+    #[test]
+    fn into_inner_of_a_shared_string_leaves_it_intact() {
+        let s = String::from(StdString::from("cel"));
+        let shared = s.clone();
+        let mut inner = s.into_inner();
+        inner.push_str("-rust");
+        assert_eq!(shared.inner(), "cel");
+    }
+
+    #[test]
+    fn debug_shows_the_string() {
+        assert_eq!(format!("{:?}", String::from("cel")), r#"String("cel")"#);
+        assert_eq!(
+            format!("{:?}", String::from(StdString::from("cel"))),
+            r#"String("cel")"#
+        );
     }
 
     #[test]

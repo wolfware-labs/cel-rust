@@ -5,14 +5,20 @@ use crate::common::value::{Builtin, BuiltinRef, CowVal, Val};
 use crate::common::{traits, types};
 use crate::ExecutionError;
 use std::ops::Deref;
+use std::sync::Arc;
 
 /// A CEL list whose elements may borrow data for `'v`.
+///
+/// The elements are shared: cloning a list is O(1), and a list is only
+/// copied when it is taken apart while another clone still holds it.
 #[derive(Debug, Default)]
-pub struct DefaultList<'v>(Vec<Box<dyn Val + 'v>>);
+pub struct DefaultList<'v>(Arc<Vec<Box<dyn Val + 'v>>>);
 
 impl<'v> DefaultList<'v> {
+    /// The elements, moved out when this is the only clone of the list and
+    /// copied otherwise.
     pub fn into_inner(self) -> Vec<Box<dyn Val + 'v>> {
-        self.0
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
     }
 
     pub fn inner(&self) -> &[Box<dyn Val + 'v>] {
@@ -22,7 +28,7 @@ impl<'v> DefaultList<'v> {
 
 impl<'v> Clone for DefaultList<'v> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -121,21 +127,22 @@ impl<'v> Adder for DefaultList<'v> {
     where
         Self: 'w,
     {
-        let mut rhs = rhs
+        let rhs = rhs
             .as_iterable()
-            .ok_or_else(|| ExecutionError::unsupported_binary_operator("add", self, rhs))?
-            .iter();
+            .ok_or_else(|| ExecutionError::unsupported_binary_operator("add", self, rhs))?;
+        // the elements are shared, not copied: each clone is O(1) for the built-in types
         let mut list: Vec<Box<dyn Val + 'w>> = self.0.iter().map(|i| i.clone_as_boxed()).collect();
+        let mut rhs = rhs.iter();
         while let Some(other) = rhs.next() {
             list.push(other.clone_as_boxed());
         }
-        Ok(CowVal::owned(DefaultList(list)))
+        Ok(CowVal::owned(DefaultList::from(list)))
     }
 }
 
 impl Container for DefaultList<'_> {
     fn contains(&self, value: &dyn Val) -> Result<bool, ExecutionError> {
-        for i in &self.0 {
+        for i in self.0.iter() {
             if i.equals(value) {
                 return Ok(true);
             }
@@ -211,7 +218,11 @@ impl<'v> Indexer for DefaultList<'v> {
         if i >= list.0.len() {
             return Err(out_of_bounds(idx));
         }
-        Ok(list.0.swap_remove(i))
+        // move the element out when no other clone can observe the list
+        Ok(match Arc::get_mut(&mut list.0) {
+            Some(items) => items.swap_remove(i),
+            None => list.0[i].clone(),
+        })
     }
 }
 
@@ -238,7 +249,7 @@ impl Zeroer for DefaultList<'_> {
 
 impl<'v> From<Vec<Box<dyn Val + 'v>>> for DefaultList<'v> {
     fn from(v: Vec<Box<dyn Val + 'v>>) -> Self {
-        Self(v)
+        Self(Arc::new(v))
     }
 }
 
@@ -298,9 +309,10 @@ impl<'b, 'v: 'w, 'w> traits::Iterator<'b, 'w> for SliceIterator<'b, 'v> {
 ///
 /// It is deliberately not a [`Val`]: the evaluator owns it for the duration
 /// of the loop and never binds it to a variable, so no expression can observe
-/// it half-built. Appending goes through [`MutableList::extend`] rather than
-/// [`Adder`], because growing the list in place is only sound for elements
-/// that live as long as the list does (`'v`), which the generic
+/// it half-built. Appending goes through [`MutableList::extend_owned`], which
+/// moves the elements of a freshly built list in, or [`MutableList::extend`],
+/// rather than [`Adder`], because growing the list in place is only sound for
+/// elements that live as long as the list does (`'v`), which the generic
 /// `Adder::add<'b, 'w>` cannot express. When the loop completes, the
 /// evaluator converts it into a [`DefaultList`] via
 /// [`MutableList::to_immutable`].
@@ -328,10 +340,30 @@ impl<'v> MutableList<'v> {
         Ok(())
     }
 
+    /// Appends every element of `rhs`, which must be a list: moved out of it
+    /// when it is owned, copied when it is borrowed.
+    ///
+    /// This is what a `map` / `filter` step appends: a freshly built `[expr]`
+    /// list that nothing else holds, whose elements need not be copied.
+    pub fn extend_owned(&mut self, rhs: CowVal<'_, 'v>) -> Result<(), ExecutionError> {
+        match rhs {
+            CowVal::Owned(b) => match super::into_builtin(b) {
+                Ok(Builtin::List(list)) => {
+                    // a move unless another clone of the list is still alive
+                    self.0.extend(list.into_inner());
+                    Ok(())
+                }
+                Ok(other) => self.extend(other.into_boxed().as_ref()),
+                Err(b) => self.extend(b.as_ref()),
+            },
+            CowVal::Borrowed(v) => self.extend(v),
+        }
+    }
+
     /// Converts the mutable list into an immutable [`DefaultList`], reusing
     /// the backing storage.
     pub fn to_immutable(self) -> DefaultList<'v> {
-        DefaultList(self.0)
+        DefaultList::from(self.0)
     }
 
     #[cfg(test)]
@@ -371,14 +403,14 @@ pub mod tests {
 
     #[test]
     fn list_has_indexer() {
-        let list = Box::new(DefaultList(vec![]));
+        let list = Box::new(DefaultList::default());
         assert!(list.as_indexer().is_some());
         assert!(list.into_indexer().is_some());
     }
 
     #[test]
     fn errs_out_of_index() {
-        let list = DefaultList(vec![]);
+        let list = DefaultList::from(vec![]);
         let idx: CelInt = 1.into();
         assert_eq!(
             Indexer::get(&list, &idx).err(),
@@ -392,7 +424,7 @@ pub mod tests {
 
     #[test]
     fn errs_unexpected_type() {
-        let list = DefaultList(vec![]);
+        let list = DefaultList::from(vec![]);
         let idx: CelString = "foo".into();
         assert_eq!(
             Indexer::get(&list, &idx).err(),
@@ -414,7 +446,7 @@ pub mod tests {
     fn get() {
         let val: CelString = "cel".into();
         let val: Box<dyn Val> = Box::new(val.clone());
-        let list = DefaultList(vec![val]);
+        let list = DefaultList::from(vec![val]);
         let idx: CelInt = 0.into();
         let expected: CowVal<'_, '_> = CowVal::owned(Into::<CelString>::into("cel"));
         assert_eq!(Indexer::get(&list, &idx), Ok(expected));
@@ -423,7 +455,7 @@ pub mod tests {
     #[test]
     fn get_with_uint_index() {
         let val: Box<dyn Val> = Box::new(Into::<CelString>::into("cel"));
-        let list = DefaultList(vec![val]);
+        let list = DefaultList::from(vec![val]);
         let idx: CelUInt = 0u64.into();
         let expected: CowVal<'_, '_> = CowVal::owned(Into::<CelString>::into("cel"));
         assert_eq!(Indexer::get(&list, &idx), Ok(expected));
@@ -432,7 +464,7 @@ pub mod tests {
     #[test]
     fn get_with_whole_double_index() {
         let val: Box<dyn Val> = Box::new(Into::<CelString>::into("cel"));
-        let list = DefaultList(vec![val]);
+        let list = DefaultList::from(vec![val]);
         let idx: CelDouble = 0.0.into();
         let expected: CowVal<'_, '_> = CowVal::owned(Into::<CelString>::into("cel"));
         assert_eq!(Indexer::get(&list, &idx), Ok(expected));
@@ -441,7 +473,7 @@ pub mod tests {
     #[test]
     fn get_with_fractional_double_index_errs() {
         let val: Box<dyn Val> = Box::new(Into::<CelString>::into("cel"));
-        let list = DefaultList(vec![val]);
+        let list = DefaultList::from(vec![val]);
         let idx: CelDouble = 0.5.into();
         let err = Indexer::get(&list, &idx).unwrap_err();
         assert!(matches!(err, UnsupportedIndex(..)), "got {err:?}");
@@ -482,7 +514,7 @@ pub mod tests {
     fn steal() {
         let val: CelString = "cel".into();
         let val: Box<dyn Val> = Box::new(val.clone());
-        let list = DefaultList(vec![val]);
+        let list = DefaultList::from(vec![val]);
         let idx: CelInt = 0.into();
         let expected: Box<dyn Val> = Box::new(Into::<CelString>::into("cel"));
         assert_eq!(Indexer::steal(list.into(), &idx), Ok(expected));
@@ -492,7 +524,7 @@ pub mod tests {
     fn try_into_vec() {
         let v1: Box<dyn Val> = Box::new(Into::<CelString>::into("cel"));
         let v2: Box<dyn Val> = Box::new(Into::<CelString>::into("rust"));
-        let list: Box<dyn Val> = Box::new(DefaultList(vec![v1, v2]));
+        let list: Box<dyn Val> = Box::new(DefaultList::from(vec![v1, v2]));
         let list: Vec<Box<dyn Val>> = list.try_into().unwrap();
         assert_eq!(list[0].downcast_ref::<CelString>().unwrap().inner(), "cel");
         assert_eq!(list[1].downcast_ref::<CelString>().unwrap().inner(), "rust");
@@ -502,10 +534,70 @@ pub mod tests {
     fn try_into_slice() {
         let v1: Box<dyn Val> = Box::new(Into::<CelString>::into("cel"));
         let v2: Box<dyn Val> = Box::new(Into::<CelString>::into("rust"));
-        let list: Box<dyn Val> = Box::new(DefaultList(vec![v1, v2]));
+        let list: Box<dyn Val> = Box::new(DefaultList::from(vec![v1, v2]));
         let list: &[Box<dyn Val>] = list.as_ref().try_into().unwrap();
         assert_eq!(list[0].downcast_ref::<CelString>().unwrap().inner(), "cel");
         assert_eq!(list[1].downcast_ref::<CelString>().unwrap().inner(), "rust");
+    }
+
+    #[test]
+    fn clone_is_shallow() {
+        let list = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let cloned = list.clone();
+        assert!(std::ptr::eq(list.inner(), cloned.inner()));
+        let boxed = list.clone_as_boxed();
+        let back = boxed.downcast_ref::<DefaultList>().unwrap();
+        assert!(std::ptr::eq(list.inner(), back.inner()));
+    }
+
+    #[test]
+    fn a_shared_list_holding_nan_is_not_equal_to_itself() {
+        // no `Arc::ptr_eq` shortcut: equality is element-wise, and NaN != NaN
+        let list = DefaultList::from(vec![box_val(CelDouble::from(f64::NAN))]);
+        assert!(!list.equals(&list.clone()));
+    }
+
+    #[test]
+    fn add_leaves_the_operands_intact() {
+        use crate::common::traits::Adder;
+        let l = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let shared = l.clone();
+        let rhs = DefaultList::from(vec![box_val(CelInt::from(4i64))]);
+        let sum = l.add(&rhs).unwrap();
+        let sum = sum.downcast_ref::<DefaultList>().unwrap();
+        assert_eq!(sum.inner().len(), 2);
+        assert_eq!(l.inner().len(), 1);
+        assert_eq!(shared.inner().len(), 1);
+        assert_eq!(*l.inner()[0].downcast_ref::<CelInt>().unwrap().inner(), 1);
+    }
+
+    #[test]
+    fn steal_from_a_shared_list_leaves_it_intact() {
+        let list = DefaultList::from(vec![
+            box_val(CelInt::from(1i64)),
+            box_val(CelInt::from(2i64)),
+        ]);
+        let shared = list.clone();
+        let stolen = Indexer::steal(Box::new(list), &CelInt::from(0i64)).unwrap();
+        assert_eq!(*stolen.downcast_ref::<CelInt>().unwrap().inner(), 1);
+        assert_eq!(shared.inner().len(), 2);
+        assert_eq!(
+            *shared.inner()[0].downcast_ref::<CelInt>().unwrap().inner(),
+            1
+        );
+        assert_eq!(
+            *shared.inner()[1].downcast_ref::<CelInt>().unwrap().inner(),
+            2
+        );
+    }
+
+    #[test]
+    fn into_inner_of_a_shared_list_leaves_it_intact() {
+        let list = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let shared = list.clone();
+        let mut items = list.into_inner();
+        items.clear();
+        assert_eq!(shared.inner().len(), 1);
     }
 
     use crate::common::types::list::MutableList;
@@ -552,6 +644,55 @@ pub mod tests {
         let imm = m.to_immutable();
         let s = imm.inner()[0].downcast_ref::<CelString>().unwrap();
         assert!(std::ptr::eq(s.inner(), owned.as_str()));
+    }
+
+    fn addr(v: &dyn Val) -> *const () {
+        v as *const dyn Val as *const ()
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_moves_the_elements() {
+        let item = box_val(CelString::from(String::from("cel")));
+        let item_addr = addr(item.as_ref());
+        let mut m = MutableList::with_capacity(1);
+        m.extend_owned(CowVal::owned(DefaultList::from(vec![item])))
+            .unwrap();
+        let imm = m.to_immutable();
+        assert_eq!(imm.inner().len(), 1);
+        assert_eq!(addr(imm.inner()[0].as_ref()), item_addr);
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_copies_a_borrowed_list() {
+        let rhs = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let mut m = MutableList::with_capacity(1);
+        m.extend_owned(CowVal::Borrowed(&rhs)).unwrap();
+        let imm = m.to_immutable();
+        assert_eq!(imm.inner().len(), 1);
+        assert_ne!(addr(imm.inner()[0].as_ref()), addr(rhs.inner()[0].as_ref()));
+        assert_eq!(rhs.inner().len(), 1);
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_copies_a_shared_list() {
+        let rhs = DefaultList::from(vec![box_val(CelInt::from(1i64))]);
+        let shared = rhs.clone();
+        let mut m = MutableList::with_capacity(1);
+        m.extend_owned(CowVal::owned(rhs)).unwrap();
+        assert_eq!(m.len_for_test(), 1);
+        assert_eq!(shared.inner().len(), 1);
+    }
+
+    #[test]
+    fn mutable_list_extend_owned_requires_a_list() {
+        let mut m = MutableList::with_capacity(0);
+        assert_eq!(
+            m.extend_owned(CowVal::owned(CelInt::from(1i64))),
+            Err(ExecutionError::UnexpectedType {
+                got: "int".to_owned(),
+                want: "iterable".to_owned(),
+            })
+        );
     }
 
     #[test]
