@@ -460,13 +460,13 @@ impl<'a> Frame<'a> {
     /// once the evaluation must stop, the error then being
     /// [`exceeded`](Self::exceeded).
     ///
-    /// Evaluation is single-threaded, so a relaxed load and store suffice: no
-    /// read-modify-write is needed.
+    /// Like every counter of the frame, the steps are counted with a relaxed
+    /// `fetch_add`: exact even if a custom function evaluates on the frame
+    /// from several threads at once. Cannot overflow in practice: a `u64` of
+    /// steps is centuries of evaluation.
     #[inline(always)]
     pub(crate) fn step(&self) -> bool {
-        // cannot overflow: a u64 of steps is centuries of evaluation
-        let total = self.steps.load(Ordering::Relaxed) + 1;
-        self.steps.store(total, Ordering::Relaxed);
+        let total = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
         (self.max_steps == 0 || total <= self.max_steps)
             && self.abort.load(Ordering::Relaxed) == ABORT_NONE
     }
@@ -474,8 +474,10 @@ impl<'a> Frame<'a> {
     /// Charges `steps` evaluation steps, see [`step`](Self::step).
     #[inline(never)]
     pub(crate) fn add_steps(&self, steps: u64) -> bool {
-        let total = self.steps.load(Ordering::Relaxed).saturating_add(steps);
-        self.steps.store(total, Ordering::Relaxed);
+        let total = self
+            .steps
+            .fetch_add(steps, Ordering::Relaxed)
+            .saturating_add(steps);
         if self.max_steps > 0 && total > self.max_steps {
             self.record(ABORT_STEPS);
         }
@@ -487,8 +489,10 @@ impl<'a> Frame<'a> {
     /// [`exceeded`](Self::exceeded).
     #[inline(never)]
     pub(crate) fn add_bytes(&self, bytes: u64) -> bool {
-        let total = self.bytes.load(Ordering::Relaxed).saturating_add(bytes);
-        self.bytes.store(total, Ordering::Relaxed);
+        let total = self
+            .bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
         if self.max_bytes > 0 && total > self.max_bytes {
             self.record(ABORT_BYTES);
         }
@@ -634,7 +638,14 @@ pub(crate) fn fresh_size(value: &dyn Val) -> u64 {
 /// Strings, bytes, lists, maps and optionals share their contents behind an
 /// `Arc` (or borrow them), so a copy allocates nothing but its box, which is
 /// not charged. A struct copies its field table, [`MAP_SLOT`] per field.
-/// Values of other types are not charged: their cost is unknown.
+///
+/// Values of other types are not charged. For the built-in scalars (`int`,
+/// `bool`, `timestamp`, ...) and opaque values (an `Arc`) the copy is a
+/// small fixed-size box, paid for by the steps of the node that copies it.
+/// A custom [`Val`] decides in its own `clone_as_boxed` what a copy costs,
+/// which the interpreter cannot see: an embedder exposing a custom value
+/// whose copy is expensive should make it cheap to clone (share it behind an
+/// `Arc`), as the built-in containers are.
 pub(crate) fn clone_size(value: &dyn Val) -> u64 {
     match value.as_builtin() {
         #[cfg(feature = "structs")]
@@ -1309,6 +1320,34 @@ mod tests {
         let mut ctx = steps_budget(20);
         ctx.add_function("loosen", loosen).unwrap();
         assert_eq!(run(&ctx, "loosen()"), steps_exceeded(20));
+    }
+
+    #[test]
+    fn steps_are_counted_exactly_across_threads() {
+        // A custom function may evaluate on the running frame from several
+        // threads at once: the counters are read-modify-write, so no step is
+        // lost.
+        fn fan_out(ftx: &FunctionContext) -> ResolveResult {
+            let program = Program::compile("1 + 1").unwrap();
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        for _ in 0..10_000 {
+                            program.execute(ftx.ptx).unwrap();
+                        }
+                    });
+                }
+            });
+            Ok(Value::Bool(true))
+        }
+        let mut ctx = steps_budget(u64::MAX / 2);
+        ctx.add_function("fanOut", fan_out).unwrap();
+        let (result, usage) = Program::compile("fanOut()")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, Ok(true.into()));
+        // one node and one dispatch, then 4 x 10,000 x 3 steps
+        assert_eq!(usage.steps, 2 + 4 * 10_000 * 3);
     }
 
     #[test]
