@@ -378,11 +378,18 @@ mod test {
 
     // A helper function that requires T to implement some traits
     fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
 
     #[test]
     fn test_context_is_send() {
         // This line will only compile if assertion passes
         assert_send::<super::Context>();
+    }
+
+    #[test]
+    fn test_context_is_sync() {
+        // A context is shared by reference across threads evaluating programs.
+        assert_sync::<super::Context>();
     }
 
     /// A [`VariableResolver`] can hand back a lazy, `Indexer`-backed [`Val`] directly -
