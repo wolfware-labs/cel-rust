@@ -12,12 +12,17 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 /// A CEL map whose keys and values may borrow data for `'v`.
+///
+/// The entries are shared: cloning a map is O(1), and a map is only copied
+/// when it is taken apart while another clone still holds it.
 #[derive(Debug, Default)]
-pub struct DefaultMap<'v>(HashMap<Key<'v>, Box<dyn Val + 'v>>);
+pub struct DefaultMap<'v>(Arc<HashMap<Key<'v>, Box<dyn Val + 'v>>>);
 
 impl<'v> DefaultMap<'v> {
+    /// The entries, moved out when this is the only clone of the map and
+    /// copied otherwise.
     pub fn into_inner(self) -> HashMap<Key<'v>, Box<dyn Val + 'v>> {
-        self.0
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
     }
 
     pub fn inner(&self) -> &HashMap<Key<'v>, Box<dyn Val + 'v>> {
@@ -35,7 +40,7 @@ impl<'v> Deref for DefaultMap<'v> {
 
 impl<'v> Clone for DefaultMap<'v> {
     fn clone(&self) -> Self {
-        Self(self.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -249,7 +254,12 @@ impl<'v> Indexer for DefaultMap<'v> {
         Self: 'w,
     {
         let mut map = self;
-        match lookup(key, |k| map.0.remove(k)) {
+        // move the value out when no other clone can observe the map
+        let found = match Arc::get_mut(&mut map.0) {
+            Some(entries) => lookup(key, |k| entries.remove(k)),
+            None => map.find(key).map(|v| v.clone_as_boxed()),
+        };
+        match found {
             Some(v) => Ok(v as Box<dyn Val + 'w>),
             None if is_lookup_key(key) => Err(no_such_key(key)),
             None => Err(unsupported_key(key)),
@@ -280,7 +290,7 @@ impl Zeroer for DefaultMap<'_> {
 
 impl<'v> From<HashMap<Key<'v>, Box<dyn Val + 'v>>> for DefaultMap<'v> {
     fn from(value: HashMap<Key<'v>, Box<dyn Val + 'v>>) -> Self {
-        Self(value)
+        Self(Arc::new(value))
     }
 }
 
@@ -536,4 +546,72 @@ pub(crate) fn stdlib(env: &mut crate::Env) {
         traits::adapter::sizer_size,
     )
     .expect("Must be unique id");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DefaultMap, Key};
+    use crate::common::traits::Indexer;
+    use crate::common::types::{CelDouble, CelInt, CelString};
+    use crate::common::value::Val;
+    use std::collections::HashMap;
+
+    fn map<'v>(entries: Vec<(&'v str, Box<dyn Val + 'v>)>) -> DefaultMap<'v> {
+        entries
+            .into_iter()
+            .map(|(k, v)| (Key::from(k), v))
+            .collect::<HashMap<_, _>>()
+            .into()
+    }
+
+    #[test]
+    fn clone_is_shallow() {
+        let m = map(vec![("a", Box::new(CelInt::from(1i64)))]);
+        let cloned = m.clone();
+        assert!(std::ptr::eq(m.inner(), cloned.inner()));
+        let boxed = m.clone_as_boxed();
+        let back = boxed.downcast_ref::<DefaultMap>().unwrap();
+        assert!(std::ptr::eq(m.inner(), back.inner()));
+    }
+
+    #[test]
+    fn steal_from_a_shared_map_leaves_it_intact() {
+        let m = map(vec![
+            ("a", Box::new(CelInt::from(1i64))),
+            ("b", Box::new(CelInt::from(2i64))),
+        ]);
+        let shared = m.clone();
+        let stolen = Indexer::steal(Box::new(m), &CelString::from("a")).unwrap();
+        assert_eq!(*stolen.downcast_ref::<CelInt>().unwrap().inner(), 1);
+        assert_eq!(shared.inner().len(), 2);
+        assert!(Indexer::get(&shared, &CelString::from("a")).is_ok());
+    }
+
+    #[test]
+    fn steal_from_a_unique_map_moves_the_value_out() {
+        let value: Box<dyn Val> = Box::new(CelString::from("x".repeat(16)));
+        let addr = value.as_ref() as *const dyn Val as *const ();
+        let m = map(vec![("a", value)]);
+        let stolen = Indexer::steal(Box::new(m), &CelString::from("a")).unwrap();
+        assert!(std::ptr::eq(
+            stolen.as_ref() as *const dyn Val as *const (),
+            addr
+        ));
+    }
+
+    #[test]
+    fn into_inner_of_a_shared_map_leaves_it_intact() {
+        let m = map(vec![("a", Box::new(CelInt::from(1i64)))]);
+        let shared = m.clone();
+        let mut entries = m.into_inner();
+        entries.clear();
+        assert_eq!(shared.inner().len(), 1);
+    }
+
+    #[test]
+    fn a_shared_map_holding_nan_is_not_equal_to_itself() {
+        // no `Arc::ptr_eq` shortcut: equality is entry-wise, and NaN != NaN
+        let m = map(vec![("a", Box::new(CelDouble::from(f64::NAN)))]);
+        assert!(!m.equals(&m.clone()));
+    }
 }
