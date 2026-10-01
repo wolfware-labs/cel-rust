@@ -37,6 +37,10 @@ harness = false
 name = "parser"
 harness = false
 
+[[bench]]
+name = "probes"
+harness = false
+
 [features]
 default = ["regex", "chrono"]
 structs = []
