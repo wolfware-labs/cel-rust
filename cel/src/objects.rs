@@ -904,9 +904,7 @@ impl<'b, 'v> TryFrom<&'b (dyn Val + 'v)> for Value {
             Kind::Double => Ok(Value::Float(*built_in::<CelDouble>(v)?.inner())),
             Kind::String => Ok(Value::String(built_in::<CelString>(v)?.to_arc())),
             Kind::NullType => Ok(Value::Null),
-            Kind::Bytes => Ok(Value::Bytes(Arc::new(
-                built_in::<CelBytes>(v)?.inner().to_vec(),
-            ))),
+            Kind::Bytes => Ok(Value::Bytes(built_in::<CelBytes>(v)?.to_arc())),
             #[cfg(feature = "chrono")]
             Kind::Duration => Ok(Value::Duration(*built_in::<CelDuration>(v)?.inner())),
             #[cfg(feature = "chrono")]
@@ -968,7 +966,7 @@ impl TryFrom<Value> for Box<dyn Val> {
             Value::Float(f) => Ok(Box::new(CelDouble::from(f))),
             Value::String(s) => Ok(Box::new(CelString::from(s))),
             Value::Null => Ok(Box::new(CelNull)),
-            Value::Bytes(b) => Ok(Box::new(CelBytes::from(b.as_slice().to_vec()))),
+            Value::Bytes(b) => Ok(Box::new(CelBytes::from(b))),
             #[cfg(feature = "chrono")]
             Value::Duration(d) => Ok(Box::new(CelDuration::from(d))),
             #[cfg(feature = "chrono")]
@@ -2740,6 +2738,30 @@ mod tests {
                 panic!("expected a string")
             };
             assert!(Arc::ptr_eq(&out, &arc));
+        }
+
+        #[test]
+        fn bytes_roundtrip_shares() {
+            let arc = Arc::new(vec![1u8, 2, 3]);
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("b", Value::Bytes(arc.clone()));
+            let Value::Bytes(out) = execute(&ctx, "b") else {
+                panic!("expected bytes")
+            };
+            assert!(Arc::ptr_eq(&out, &arc));
+        }
+
+        #[test]
+        fn bytes_argument_shares() {
+            let arc = Arc::new(vec![1u8, 2, 3]);
+            let mut ctx = Context::default();
+            ctx.add_function("addr", |b: Arc<Vec<u8>>| Arc::as_ptr(&b) as usize as u64)
+                .unwrap();
+            ctx.add_variable_from_value("b", Value::Bytes(arc.clone()));
+            assert_eq!(
+                execute(&ctx, "addr(b)"),
+                Value::UInt(Arc::as_ptr(&arc) as usize as u64)
+            );
         }
 
         #[test]

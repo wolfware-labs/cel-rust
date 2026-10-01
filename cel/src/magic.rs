@@ -100,11 +100,7 @@ impl FromVal for Arc<String> {
 
 impl FromVal for Arc<Vec<u8>> {
     fn from_val(value: &dyn Val) -> Result<Self, ExecutionError> {
-        Ok(Arc::new(
-            downcast_or_unexpected::<CelBytes>(value, "Arc<Vec<u8>>")?
-                .inner()
-                .to_vec(),
-        ))
+        Ok(downcast_or_unexpected::<CelBytes>(value, "Arc<Vec<u8>>")?.to_arc())
     }
 }
 
