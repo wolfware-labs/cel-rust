@@ -59,6 +59,8 @@ pub struct Env {
     types: TypeRegistry,
     options: RuntimeOptions,
     error_on_duplicate_map_keys: bool,
+    #[cfg(feature = "regex")]
+    regex_cache: crate::RegexCache,
 }
 
 impl Default for Env {
@@ -69,6 +71,8 @@ impl Default for Env {
             types: TypeRegistry::default(),
             options: RuntimeOptions::default(),
             error_on_duplicate_map_keys: true,
+            #[cfg(feature = "regex")]
+            regex_cache: crate::RegexCache::default(),
         }
     }
 }
@@ -321,6 +325,36 @@ impl Env {
     /// ```
     pub fn set_options(&mut self, options: RuntimeOptions) {
         self.options = options;
+    }
+
+    /// The regular expressions the standard library's `matches` compiled,
+    /// kept for the next call of the same pattern by any evaluation under
+    /// this environment.
+    #[cfg(feature = "regex")]
+    pub fn regex_cache(&self) -> &crate::RegexCache {
+        &self.regex_cache
+    }
+
+    /// Replaces the regex cache with an empty one made with `options`.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{Context, Env, Program, RegexCacheOptions};
+    /// use std::sync::Arc;
+    ///
+    /// let mut env = Env::stdlib();
+    /// env.set_regex_cache_options(RegexCacheOptions::default().with_capacity(256));
+    /// let env = Arc::new(env);
+    /// let ctx = Context::with_env(env.clone());
+    ///
+    /// let program = Program::compile("['abc', 'abd'].all(s, s.matches('^ab'))").unwrap();
+    /// assert_eq!(program.execute(&ctx), Ok(true.into()));
+    /// // compiled once, for both elements
+    /// assert_eq!(env.regex_cache().len(), 1);
+    /// ```
+    #[cfg(feature = "regex")]
+    pub fn set_regex_cache_options(&mut self, options: crate::RegexCacheOptions) {
+        self.regex_cache = crate::RegexCache::new(options);
     }
 
     /// The types registered with the environment.

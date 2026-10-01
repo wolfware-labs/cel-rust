@@ -107,3 +107,8 @@ assert_eq!(usage.iterations, 3);
 
 Custom functions can poll the handle through `FunctionContext::is_interrupted()` to return early from
 long-running work.
+
+The standard library's `matches` compiles each pattern once: the `Env` keeps the compiled regexes in a
+`cel::RegexCache` (64 patterns by default, see `Env::set_regex_cache_options`) shared by every evaluation
+under it. Under a steps budget, only the call that compiles a pattern pays for parsing and compiling it;
+later calls pay the lookup and the match.

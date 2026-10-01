@@ -324,8 +324,9 @@ fn size(this: &String<'_>) -> CelInt {
     Sizer::size(this)
 }
 
-/// `string.matches(string)`. Under a budget, the frame compiles the pattern
-/// and charges it, see [`Frame::is_match`](crate::runtime::Frame::is_match).
+/// `string.matches(string)`. The pattern is compiled once, and kept by the
+/// Env's [`RegexCache`](crate::RegexCache). Under a budget, the frame
+/// limits and charges it, see [`Frame::is_match`](crate::runtime::Frame::is_match).
 #[cfg(feature = "regex")]
 fn matches<'b, 'v>(
     ectx: &crate::common::functions::EvalCtx<'_>,
@@ -344,17 +345,12 @@ fn matches<'b, 'v>(
             })
     };
     let (this, re) = (string(0)?, string(1)?);
+    let cache = ectx.env().regex_cache();
     let matched = match ectx.frame() {
-        Some(frame) => frame.is_match(this.inner(), re.inner())?,
-        None => match regex::Regex::new(re.inner()) {
-            Ok(compiled) => compiled.is_match(this.inner()),
-            Err(err) => {
-                return Err(ExecutionError::FunctionError {
-                    function: "matches".to_string(),
-                    message: format!("'{}' not a valid regex:\n{err}", re.inner()),
-                })
-            }
-        },
+        Some(frame) => frame.is_match(cache, this.inner(), re.inner())?,
+        None => cache
+            .get(re.inner(), crate::regex_cache::size_limit(0))
+            .is_match(this.inner())?,
     };
     Ok(CowVal::owned(CelBool::from(matched)))
 }
