@@ -1202,6 +1202,39 @@ mod tests {
         assert_eq!(run(&ctx, "size(l + l)"), Ok(4_000.into()));
     }
 
+    #[test]
+    fn steps_budget_charges_large_keys_sizes_and_orderings() {
+        // Hashing a map key, counting a string's characters and ordering two
+        // strings or bytes values all walk them: one step per 64 bytes.
+        let mut ctx = steps_budget(10_000);
+        let big = "a".repeat(1 << 20);
+        ctx.add_variable("big", big.clone()).unwrap();
+        ctx.add_variable("big2", big.clone()).unwrap();
+        ctx.add_variable_from_value("bb", Value::Bytes(Arc::new(big.clone().into_bytes())));
+        ctx.add_variable_from_value("mb", std::collections::HashMap::from([(big, 1i64)]));
+        ctx.add_variable("l", (0..2_000i64).collect::<Vec<_>>())
+            .unwrap();
+        for src in [
+            "l.all(x, mb[big] == 1)",
+            "l.all(x, mb[?big].hasValue())",
+            "l.all(x, size(big) > 0)",
+            "l.all(x, big.size() > 0)",
+            "l.all(x, big <= big2)",
+            "l.all(x, big > big2 || true)",
+            "l.all(x, bb < bb || true)",
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(run_optional(&ctx, src), steps_exceeded(10_000), "{src}");
+            assert!(
+                started.elapsed() < Duration::from_millis(20),
+                "{src} took {:?}",
+                started.elapsed()
+            );
+        }
+        // small ones stay cheap
+        assert_eq!(run(&ctx, "size('abc') == 3 && 'a' < 'b'"), Ok(true.into()));
+    }
+
     fn bytes_budget(max_bytes: u64) -> Context<'static, 'static> {
         let mut ctx = with_options(RuntimeOptions::default().with_max_bytes(max_bytes));
         ctx.add_variable("s", "x".repeat(1_000)).unwrap();

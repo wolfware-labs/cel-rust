@@ -1193,6 +1193,7 @@ impl Value {
                             };
 
                             let index = Self::resolve_val(&call.args[1], ctx)?;
+                            charge_lookup(ctx, index.as_ref(), value.as_ref())?;
                             let overload_error = ExecutionError::overload_for_values(
                                 &call.func_name,
                                 [value.as_ref(), index.as_ref()],
@@ -1339,6 +1340,7 @@ impl Value {
                         operators::LESS => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     == Ordering::Less,
@@ -1347,6 +1349,7 @@ impl Value {
                         operators::LESS_EQUALS => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     != Ordering::Greater,
@@ -1355,6 +1358,7 @@ impl Value {
                         operators::GREATER => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     == Ordering::Greater,
@@ -1363,6 +1367,7 @@ impl Value {
                         operators::GREATER_EQUALS => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     != Ordering::Less,
@@ -1945,6 +1950,8 @@ fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), Executi
     };
     let scan = match name {
         "contains" | "startsWith" | "endsWith" => string_len(0).map_or(0, |len| len / 64 + 1),
+        // a string's size counts its characters
+        "size" => string_len(0).map_or(0, |len| len / 64),
         // compiling and matching are charged by `Frame::is_match`, by the
         // size of the compiled automaton
         "matches" => {
@@ -1970,7 +1977,8 @@ fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), Executi
     }
 }
 
-/// Charges the steps of comparing `lhs` with `rhs` deeply, see
+/// Charges the steps of comparing `lhs` with `rhs` deeply, for equality or
+/// ordering, see
 /// [`compare_size`]: the cheaper of the two walks, as a comparison stops at
 /// the end of the smaller operand.
 #[inline(always)]
@@ -1986,6 +1994,24 @@ fn equality_in(frame: &Frame, lhs: &dyn Val, rhs: &dyn Val) -> bool {
     let cap = frame.steps_left();
     let cost = compare_size(lhs, cap).min(compare_size(rhs, cap));
     frame.add_steps(cost)
+}
+
+/// Charges the steps of `container[key]`: a map hashes and compares the key,
+/// as `in` on a map does; indexing anything else costs nothing more.
+#[inline(always)]
+fn charge_lookup(ctx: &Context, key: &dyn Val, container: &dyn Val) -> Result<(), ExecutionError> {
+    match ctx.frame() {
+        Some(frame) if !lookup_in(frame, key, container) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn lookup_in(frame: &Frame, key: &dyn Val, container: &dyn Val) -> bool {
+    match container.as_builtin() {
+        BuiltinRef::Map(_) => frame.add_steps(compare_size(key, frame.steps_left())),
+        _ => true,
+    }
 }
 
 /// Charges the steps of `needle in container`: a list compares the needle
