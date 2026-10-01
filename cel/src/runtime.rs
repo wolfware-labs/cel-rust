@@ -142,6 +142,7 @@ pub struct RuntimeOptions {
     max_steps: u64,
     max_bytes: u64,
     max_regex_len: u64,
+    regex_size_limit: u64,
 }
 
 impl Default for RuntimeOptions {
@@ -154,6 +155,7 @@ impl Default for RuntimeOptions {
             max_steps: 0,
             max_bytes: 0,
             max_regex_len: 0,
+            regex_size_limit: 0,
         }
     }
 }
@@ -278,6 +280,26 @@ impl RuntimeOptions {
         self.max_regex_len
     }
 
+    /// Caps the size, in bytes, of the automaton `matches` compiles a
+    /// pattern into, and of its lazy DFA cache, while a frame is enforcing a
+    /// budget. A pattern whose automaton would be larger fails `matches` with
+    /// an [`ExecutionError::FunctionError`](crate::ExecutionError::FunctionError),
+    /// after at most the work of building that much automaton.
+    ///
+    /// Short patterns can compile to large automata: `\w{30}` is over 1 MiB
+    /// with Unicode word characters, and compiling 1 MiB takes about 10 ms.
+    /// Zero, the default, keeps the `regex` crate's limits (10 MiB, with a
+    /// 2 MiB cache).
+    pub fn with_regex_size_limit(mut self, bytes: u64) -> Self {
+        self.regex_size_limit = bytes;
+        self
+    }
+
+    /// The compiled regex size limit, zero meaning the `regex` crate's default.
+    pub fn regex_size_limit(&self) -> u64 {
+        self.regex_size_limit
+    }
+
     /// These options laid over `base`: every field these options leave unset
     /// (zero, the default) takes the value it has in `base`.
     pub(crate) fn over(&self, base: &RuntimeOptions) -> RuntimeOptions {
@@ -291,6 +313,7 @@ impl RuntimeOptions {
             max_steps: pick(self.max_steps, base.max_steps),
             max_bytes: pick(self.max_bytes, base.max_bytes),
             max_regex_len: pick(self.max_regex_len, base.max_regex_len),
+            regex_size_limit: pick(self.regex_size_limit, base.regex_size_limit),
         }
     }
 
@@ -300,6 +323,7 @@ impl RuntimeOptions {
             && self.max_steps == 0
             && self.max_bytes == 0
             && self.max_regex_len == 0
+            && self.regex_size_limit == 0
     }
 }
 
@@ -379,6 +403,8 @@ pub struct Frame<'a> {
     max_bytes: u64,
     bytes: AtomicU64,
     max_regex_len: u64,
+    #[cfg_attr(not(feature = "regex"), allow(dead_code))]
+    regex_size_limit: u64,
 }
 
 impl<'a> Frame<'a> {
@@ -395,6 +421,7 @@ impl<'a> Frame<'a> {
             max_bytes: options.max_bytes,
             bytes: AtomicU64::new(0),
             max_regex_len: options.max_regex_len,
+            regex_size_limit: options.regex_size_limit,
         }
     }
 
@@ -441,6 +468,74 @@ impl<'a> Frame<'a> {
     /// The longest regex pattern `matches` accepts, zero meaning unlimited.
     pub(crate) fn max_regex_len(&self) -> u64 {
         self.max_regex_len
+    }
+
+    /// Compiles `pattern` and matches it against `subject`, as `matches`
+    /// does, charging the steps the compiled automaton costs.
+    ///
+    /// The pattern is compiled with the same configuration as
+    /// `regex::Regex::new` (so the result and the error messages are the
+    /// same), bounded by [`RuntimeOptions::with_regex_size_limit`]. The
+    /// charges are calibrated on measured CPU, about 80 ns per step:
+    ///
+    /// - compiling: one step per 8 bytes of the compiled automaton, or of the
+    ///   size limit when the compile fails for size, as the work up to the
+    ///   limit was done anyway;
+    /// - matching: two steps per KiB of automaton per 64 bytes of subject
+    ///   (rounded up), charged before matching, as a match can cost up to
+    ///   the automaton's states times the subject.
+    #[cfg(feature = "regex")]
+    pub(crate) fn is_match(&self, subject: &str, pattern: &str) -> Result<bool, ExecutionError> {
+        use regex_automata::{meta, util::syntax, MatchKind};
+        // `regex::RegexBuilder`'s defaults
+        const NFA_SIZE_LIMIT: usize = 10 << 20;
+        const DFA_SIZE_LIMIT: usize = 2 << 20;
+        let (nfa_limit, dfa_limit) = match self.regex_size_limit {
+            0 => (NFA_SIZE_LIMIT, DFA_SIZE_LIMIT),
+            limit => {
+                let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+                (limit, limit.min(DFA_SIZE_LIMIT))
+            }
+        };
+        let built = meta::Builder::new()
+            .configure(
+                meta::Config::new()
+                    .nfa_size_limit(Some(nfa_limit))
+                    .hybrid_cache_capacity(dfa_limit)
+                    .match_kind(MatchKind::LeftmostFirst)
+                    .utf8_empty(true),
+            )
+            .syntax(syntax::Config::new().utf8(true))
+            .build(pattern);
+        let regex = match built {
+            Ok(regex) => regex,
+            Err(err) => {
+                // as `regex::Error` reports a `meta::BuildError`
+                let (steps, message) = match (err.size_limit(), err.syntax_error()) {
+                    (Some(limit), _) => (
+                        limit as u64 / 8,
+                        format!("Compiled regex exceeds size limit of {limit} bytes."),
+                    ),
+                    (None, Some(syntax)) => (pattern.len() as u64 / 64 + 1, syntax.to_string()),
+                    (None, None) => (pattern.len() as u64 / 64 + 1, err.to_string()),
+                };
+                if !self.add_steps(steps) {
+                    return Err(self.exceeded());
+                }
+                return Err(ExecutionError::function_error(
+                    "matches",
+                    format!("'{pattern}' not a valid regex:\n{message}"),
+                ));
+            }
+        };
+        let size = regex.memory_usage() as u64;
+        let scan = (size / 1024 + 1)
+            .saturating_mul(subject.len() as u64 / 64 + 1)
+            .saturating_mul(2);
+        if !self.add_steps((size / 8).saturating_add(scan)) {
+            return Err(self.exceeded());
+        }
+        Ok(regex.is_match(subject))
     }
 
     /// The resources used so far by the evaluation.
@@ -941,6 +1036,77 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         // a short pattern over the same subject still fits
         assert_eq!(run(&ctx, "s.matches('^a+$')"), Ok(true.into()));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_matches_by_compiled_size() {
+        // Short patterns can compile to huge automata (`\w` is every Unicode
+        // word character): the charge follows the compiled size, so a failed
+        // or huge compile swallowed by `|| true` still exhausts the budget.
+        let mut ctx = with_options(
+            RuntimeOptions::default()
+                .with_max_steps(10_000)
+                .with_regex_size_limit(64 * 1024),
+        );
+        ctx.add_variable("s", "a".repeat(8 * 1024)).unwrap();
+        ctx.add_variable("l", (0..2_000i64).collect::<Vec<_>>())
+            .unwrap();
+        for src in [
+            r"l.all(x, 'a'.matches(r'\w{1000}') || true)",
+            r"l.all(x, 'a'.matches(r'(\w{100}){100}') || true)",
+            r"l.all(x, 'a'.matches(r'(?:\w{50}){40}') || true)",
+            r"l.all(x, !s.matches(r'\p{L}{200}x'))",
+            r"l.all(x, !s.matches(r'.{1000}x') || true)",
+            r"l.all(x, !s.matches(r'[\w\W]{300}b') || true)",
+            r"l.all(x, !s.matches(r'.{60}x'))",
+        ] {
+            let started = std::time::Instant::now();
+            let result = run(&ctx, src);
+            // the budget runs out, or (unswallowed) a pattern over the size
+            // limit fails, as a pattern does without a budget
+            assert!(
+                result == steps_exceeded(10_000)
+                    || matches!(
+                        &result,
+                        Err(ExecutionError::FunctionError { message, .. })
+                            if message.ends_with("exceeds size limit of 65536 bytes.")
+                    ),
+                "{src}: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "{src} took {:?}",
+                started.elapsed()
+            );
+        }
+        // ordinary patterns stay cheap
+        assert_eq!(
+            run(
+                &ctx,
+                "'/api/v1/users/42'.matches('^/api/v[0-9]+/users/[0-9]+$')"
+            ),
+            Ok(true.into())
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn regex_size_limit_fails_big_compiles() {
+        let ctx = with_options(RuntimeOptions::default().with_regex_size_limit(16 * 1024));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run(&ctx, r"'a'.matches(r'\w{1000}')"),
+            Err(ExecutionError::function_error(
+                "matches",
+                "'\\w{1000}' not a valid regex:\nCompiled regex exceeds size limit of 16384 bytes."
+            ))
+        );
+        // a 16 KiB limit is reached in well under the 10 MiB default's time
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(run(&ctx, "'abc'.matches('^a.c$')"), Ok(true.into()));
+        // unset by default, so `matches` keeps the regex crate's limits
+        assert_eq!(RuntimeOptions::default().regex_size_limit(), 0);
     }
 
     #[cfg(feature = "regex")]

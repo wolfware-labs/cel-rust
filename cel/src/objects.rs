@@ -1455,6 +1455,12 @@ impl Value {
                         let target = Value::resolve_val(target_expr, ctx)?;
                         args.insert(0, target);
                         charge_dispatch(ctx, &call.func_name, &args)?;
+                        #[cfg(feature = "regex")]
+                        if let Some(frame) = ctx.frame() {
+                            if let Some(result) = budgeted_matches(frame, &call.func_name, &args) {
+                                return result;
+                            }
+                        }
                         if let Some(op) = ctx.env().find_member_overload(&call.func_name, &args) {
                             return charge_fresh(ctx.frame(), op(args)?);
                         }
@@ -1894,6 +1900,28 @@ fn charge_conversion(frame: Option<&Frame<'_>>, value: &dyn Val) -> Result<(), E
     }
 }
 
+/// Runs `subject.matches(pattern)` under a budget: compiled and charged by
+/// [`Frame::is_match`], by the size of the compiled automaton, instead of by
+/// the stdlib overload, which cannot see the frame. Only the string overload
+/// is taken over; anything else falls through to the overloads.
+#[cfg(feature = "regex")]
+#[inline(never)]
+fn budgeted_matches<'b, 'v>(
+    frame: &Frame,
+    name: &str,
+    args: &[CowVal],
+) -> Option<Result<CowVal<'b, 'v>, ExecutionError>> {
+    let [subject, pattern] = args else {
+        return None;
+    };
+    if name != "matches" {
+        return None;
+    }
+    let subject = subject.downcast_ref::<CelString>()?;
+    let pattern = pattern.downcast_ref::<CelString>()?;
+    Some(frame.is_match(subject.inner(), pattern.inner()).map(bool))
+}
+
 /// Charges the steps of dispatching the function `name` on `args`: one, plus
 /// one per 64 bytes of the string searched by the string functions whose cost
 /// grows with it, and for `matches`, whose cost grows with the pattern times
@@ -1917,9 +1945,11 @@ fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), Executi
     };
     let scan = match name {
         "contains" | "startsWith" | "endsWith" => string_len(0).map_or(0, |len| len / 64 + 1),
+        // compiling and matching are charged by `Frame::is_match`, by the
+        // size of the compiled automaton
         "matches" => {
-            match (string_len(0), string_len(1)) {
-                (Some(subject), Some(pattern)) => {
+            match string_len(1) {
+                Some(pattern) => {
                     let limit = frame.max_regex_len();
                     if limit > 0 && pattern > limit {
                         return Err(ExecutionError::function_error(
@@ -1927,10 +1957,9 @@ fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), Executi
                         format!("regex pattern of {pattern} bytes exceeds the limit of {limit} bytes"),
                     ));
                     }
-                    (pattern / 64 + 1).saturating_mul(subject / 64 + 1)
+                    0
                 }
-                (Some(subject), None) => subject / 64 + 1,
-                _ => 0,
+                None => string_len(0).map_or(0, |len| len / 64 + 1),
             }
         }
         _ => 0,
