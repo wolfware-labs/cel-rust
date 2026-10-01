@@ -67,11 +67,8 @@ impl<'v> Clone for Struct<'v> {
     fn clone(&self) -> Self {
         Self {
             r#type: Type::new_struct(self.name().to_owned()),
-            entries: self
-                .entries
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::from(v.clone_as_boxed())))
-                .collect(),
+            // the fields are immutable: share them
+            entries: self.entries.clone(),
         }
     }
 }
@@ -195,6 +192,7 @@ mod tests {
         types::{CelBool, CelStruct},
         value::CowVal,
     };
+    use std::sync::Arc;
 
     #[test]
     fn equality() {
@@ -206,5 +204,17 @@ mod tests {
         assert_eq!(s1, s2);
         s2.add_field_value("bar".to_owned(), CowVal::owned(CelBool::from(false)));
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn clone_shares_the_fields() {
+        let mut s = CelStruct::new("foo".to_owned());
+        s.add_field_value("bar".to_owned(), CowVal::owned(CelBool::from(true)));
+        let cloned = s.clone();
+        assert_eq!(s, cloned);
+        assert!(Arc::ptr_eq(
+            &s.field_values()["bar"],
+            &cloned.field_values()["bar"]
+        ));
     }
 }
