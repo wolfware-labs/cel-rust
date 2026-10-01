@@ -1562,7 +1562,7 @@ impl Value {
 
                     if let Some(value) = value {
                         if ctx.env().error_on_duplicate_map_keys() && map::has_key(&map, &key) {
-                            return Err(ExecutionError::DuplicateKey(Key::from(key).into()));
+                            return Err(ExecutionError::DuplicateKey(duplicate_key(key)));
                         }
                         map.insert(key, owned(ctx.frame(), value)?);
                     }
@@ -1652,6 +1652,20 @@ impl Value {
             Expr::Unspecified => panic!("Can't evaluate Unspecified Expr"),
         }
     }
+}
+
+/// The key a [`ExecutionError::DuplicateKey`] reports: a string key longer
+/// than 64 characters is cut to its first 64 and an ellipsis, so the error,
+/// built outside any budget, never copies a large key.
+fn duplicate_key(key: CelMapKey) -> Value {
+    const SHOWN: usize = 64;
+    if let Some(s) = key.inner().downcast_ref::<CelString>() {
+        let s = s.inner();
+        if let Some((cut, _)) = s.char_indices().nth(SHOWN) {
+            return Value::String(Arc::new(format!("{}…", &s[..cut])));
+        }
+    }
+    Key::from(key).into()
 }
 
 /// A boolean result, borrowed from a constant: no allocation.

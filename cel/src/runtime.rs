@@ -1235,6 +1235,27 @@ mod tests {
         assert_eq!(run(&ctx, "size('abc') == 3 && 'a' < 'b'"), Ok(true.into()));
     }
 
+    #[test]
+    fn a_repeated_long_map_key_is_truncated_in_the_error() {
+        // The error is built outside any budget: it must not copy the key.
+        let mut ctx = Context::default();
+        let s = "a".repeat(8 * 1024);
+        ctx.add_variable("s", s.clone()).unwrap();
+        match run(&ctx, "{s: 1, s: 2}") {
+            Err(ExecutionError::DuplicateKey(Value::String(key))) => {
+                assert_eq!(*key, format!("{}…", &s[..64]));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // short keys are reported whole
+        assert_eq!(
+            run(&ctx, "{'k': 1, 'k': 2}"),
+            Err(ExecutionError::DuplicateKey(Value::String(Arc::new(
+                "k".into()
+            ))))
+        );
+    }
+
     fn bytes_budget(max_bytes: u64) -> Context<'static, 'static> {
         let mut ctx = with_options(RuntimeOptions::default().with_max_bytes(max_bytes));
         ctx.add_variable("s", "x".repeat(1_000)).unwrap();
