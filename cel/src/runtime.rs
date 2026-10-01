@@ -1111,6 +1111,62 @@ mod tests {
         assert_eq!(RuntimeOptions::default().regex_size_limit(), 0);
     }
 
+    /// Runs `src` against `ctx` without a budget and with one, which must
+    /// not change the result.
+    #[cfg(feature = "regex")]
+    fn same_with_and_without_budget(
+        mut ctx: Context<'static, 'static>,
+        src: &str,
+    ) -> ResolveResult {
+        let unbudgeted = run(&ctx, src);
+        ctx.set_budget(RuntimeOptions::default().with_max_steps(1_000_000));
+        let budgeted = run(&ctx, src);
+        assert_eq!(unbudgeted, budgeted, "{src}");
+        budgeted
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_budget_does_not_add_matches_to_an_env_without_it() {
+        let ctx = Context::with_env(Arc::new(Env::default()));
+        assert_eq!(
+            same_with_and_without_budget(ctx, "'abc'.matches('a.c')"),
+            Err(ExecutionError::UndeclaredReference(Arc::new(
+                "matches".into()
+            )))
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_budget_keeps_a_context_function_named_matches() {
+        fn glob(this: crate::extractors::This<Arc<String>>, pattern: Arc<String>) -> bool {
+            pattern.as_str() == "*" || this.0 == pattern
+        }
+        for src in ["'abc'.matches('*')", "'abc'.matches('a.c')"] {
+            let mut ctx = Context::with_env(Arc::new(Env::default()));
+            ctx.add_function("matches", glob).unwrap();
+            let expected = Ok((src == "'abc'.matches('*')").into());
+            assert_eq!(same_with_and_without_budget(ctx, src), expected, "{src}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn stdlib_matches_gives_the_same_results_with_a_budget() {
+        for src in [
+            "'abc'.matches('a.c')",
+            "'abc'.matches('^b')",
+            "'ABC'.matches('(?i)abc')",
+            r"'日本語'.matches(r'^\p{Han}+$')",
+            "'abc'.matches('[')",
+            "'abc'.matches('(?P<x>a')",
+            "'a'.matches('a{2,1}')",
+        ] {
+            let _ = same_with_and_without_budget(Context::default(), src);
+        }
+    }
+
     #[cfg(feature = "regex")]
     #[test]
     fn max_regex_len_rejects_longer_patterns() {
