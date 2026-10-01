@@ -94,7 +94,8 @@ impl From<CelMapKey<'_>> for Key {
         match value {
             CelMapKey::Bool(b) => b.into_inner().into(),
             CelMapKey::Int(i) => i.into_inner().into(),
-            CelMapKey::String(s) => s.into_inner().into(),
+            // shares an owned string's buffer, copies a borrowed one
+            CelMapKey::String(s) => Key::String(s.to_arc()),
             CelMapKey::UInt(u) => u.into_inner().into(),
         }
     }
@@ -106,7 +107,7 @@ impl From<Key> for CelMapKey<'_> {
             Key::Int(i) => CelMapKey::from(i),
             Key::Uint(u) => CelMapKey::from(u),
             Key::Bool(b) => CelMapKey::from(b),
-            Key::String(s) => CelMapKey::from(Arc::unwrap_or_clone(s)),
+            Key::String(s) => CelMapKey::String(CelString::from(s)),
         }
     }
 }
@@ -971,17 +972,26 @@ impl TryFrom<Value> for Box<dyn Val> {
             Value::Duration(d) => Ok(Box::new(CelDuration::from(d))),
             #[cfg(feature = "chrono")]
             Value::Timestamp(ts) => Ok(Box::new(CelTimestamp::from(ts))),
+            // Move the items out of a list or map no one else holds, and
+            // otherwise clone them one at a time: either way the strings,
+            // bytes and nested containers are shared, not copied.
             Value::List(l) => {
-                let result: Result<Vec<Box<dyn Val>>, ExecutionError> =
-                    (*l).clone().into_iter().map(|i| i.try_into()).collect();
+                let result: Result<Vec<Box<dyn Val>>, ExecutionError> = match Arc::try_unwrap(l) {
+                    Ok(l) => l.into_iter().map(Box::<dyn Val>::try_from).collect(),
+                    Err(l) => l.iter().map(|i| i.clone().try_into()).collect(),
+                };
                 Ok(Box::new(CelList::from(result?)))
             }
             Value::Map(map) => {
-                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> = (*map.map)
-                    .clone()
-                    .into_iter()
-                    .map(|(k, v)| v.clone().try_into().map(|v| (k.clone().into(), v)))
-                    .collect();
+                let entry = |(k, v): (Key, Value)| v.try_into().map(|v| (CelMapKey::from(k), v));
+                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> =
+                    match Arc::try_unwrap(map.map) {
+                        Ok(m) => m.into_iter().map(entry).collect(),
+                        Err(m) => m
+                            .iter()
+                            .map(|(k, v)| entry((k.clone(), v.clone())))
+                            .collect(),
+                    };
                 Ok(Box::new(CelMap::from(result?)))
             }
             Value::Opaque(o) => {
@@ -2724,7 +2734,9 @@ mod tests {
     mod sharing {
         use crate::common::types::{Type, DYN_TYPE};
         use crate::common::value::Val;
+        use crate::objects::{Key, Map};
         use crate::{Context, Program, Value};
+        use std::collections::HashMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -2810,6 +2822,46 @@ mod tests {
                 execute(&ctx, "addr(b)"),
                 Value::UInt(Arc::as_ptr(&arc) as usize as u64)
             );
+        }
+
+        #[test]
+        fn list_roundtrip_shares_the_elements() {
+            let arc = Arc::new("cel-rust".to_owned());
+            let list = Value::List(Arc::new(vec![Value::String(arc.clone())]));
+            let mut ctx = Context::default();
+            // `list` is still held here, so the conversion cannot take it apart
+            ctx.add_variable_from_value("l", list.clone());
+            let Value::List(out) = execute(&ctx, "l") else {
+                panic!("expected a list")
+            };
+            let Value::String(out) = &out[0] else {
+                panic!("expected a string")
+            };
+            assert!(Arc::ptr_eq(out, &arc));
+        }
+
+        #[test]
+        fn map_roundtrip_shares_the_keys_and_values() {
+            let key = Arc::new("key".to_owned());
+            let value = Arc::new("value".to_owned());
+            let map = Value::Map(Map {
+                map: Arc::new(HashMap::from([(
+                    Key::String(key.clone()),
+                    Value::String(value.clone()),
+                )])),
+            });
+            let mut ctx = Context::default();
+            // `map` is still held here, so the conversion cannot take it apart
+            ctx.add_variable_from_value("m", map.clone());
+            let Value::Map(out) = execute(&ctx, "m") else {
+                panic!("expected a map")
+            };
+            let (Key::String(out_key), Value::String(out_value)) = out.map.iter().next().unwrap()
+            else {
+                panic!("expected a string entry")
+            };
+            assert!(Arc::ptr_eq(out_key, &key));
+            assert!(Arc::ptr_eq(out_value, &value));
         }
 
         #[test]
