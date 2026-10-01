@@ -69,6 +69,16 @@ pub enum Context<'p, 'v> {
     },
 }
 
+// A root context is shared by reference across threads evaluating programs
+// (one per program, many workers), and the frame of an evaluation is
+// reachable from every scope: both must stay `Send + Sync`. Checked at
+// compile time, so a non-thread-safe field fails the build, not a test.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Context<'static, 'static>>();
+    assert_send_sync::<Frame<'static>>();
+};
+
 impl<'p, 'v> Context<'p, 'v> {
     pub fn add_variable<S, V>(
         &mut self,
