@@ -399,6 +399,15 @@ impl<'a> Frame<'a> {
         Ok(())
     }
 
+    /// The steps left before the steps budget is exceeded, `u64::MAX` when
+    /// there is none: the cap for walks charged before the work they price.
+    pub(crate) fn steps_left(&self) -> u64 {
+        match self.max_steps {
+            0 => u64::MAX,
+            max => max.saturating_sub(self.steps.load(Ordering::Relaxed)),
+        }
+    }
+
     /// The longest regex pattern `matches` accepts, zero meaning unlimited.
     pub(crate) fn max_regex_len(&self) -> u64 {
         self.max_regex_len
@@ -611,6 +620,61 @@ pub(crate) fn clone_size(value: &dyn Val) -> u64 {
     }
 }
 
+/// The steps comparing `value` with another value can cost, stopping once
+/// the count passes `cap`: one per list element or map entry, and one per 64
+/// bytes of every string or bytes value compared, recursively. Scalars and
+/// short strings cost nothing beyond the node that produced them.
+///
+/// Equality and `in` compare deeply, so a few nodes can compare megabytes;
+/// the walk is charged before comparing, and capped so that it costs no more
+/// than the budget it is about to exceed.
+pub(crate) fn compare_size(value: &dyn Val, cap: u64) -> u64 {
+    fn walk(value: &dyn Val, cap: u64, total: &mut u64) {
+        match value.as_builtin() {
+            BuiltinRef::String(s) => *total += s.inner().len() as u64 / 64,
+            BuiltinRef::Bytes(b) => *total += b.inner().len() as u64 / 64,
+            BuiltinRef::List(l) => {
+                *total += l.inner().len() as u64;
+                for item in l.inner() {
+                    if *total > cap {
+                        return;
+                    }
+                    walk(item.as_ref(), cap, total);
+                }
+            }
+            BuiltinRef::Map(m) => {
+                *total += m.inner().len() as u64;
+                for (key, item) in m.inner() {
+                    if *total > cap {
+                        return;
+                    }
+                    walk(key.inner(), cap, total);
+                    walk(item.as_ref(), cap, total);
+                }
+            }
+            BuiltinRef::Optional(o) => {
+                if let Some(inner) = o.option() {
+                    walk(inner, cap, total);
+                }
+            }
+            #[cfg(feature = "structs")]
+            BuiltinRef::Struct(s) => {
+                *total += s.field_count() as u64;
+                for item in s.fields() {
+                    if *total > cap {
+                        return;
+                    }
+                    walk(item, cap, total);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut total = 0;
+    walk(value, cap, &mut total);
+    total
+}
+
 /// The bytes converting `value` into a [`Value`](crate::Value) allocates,
 /// stopping once the count passes `cap`.
 ///
@@ -815,6 +879,55 @@ mod tests {
         );
         // off by default
         assert_eq!(RuntimeOptions::default().max_regex_len(), 0);
+    }
+
+    /// `s`: 8 KiB; `ls`: 2000 shares of `s`; `m`: 128 entries of 8 KiB.
+    fn deep_values(ctx: &mut Context) {
+        let s = Arc::new("a".repeat(8 * 1024));
+        ctx.add_variable_from_value("s", Value::String(s.clone()));
+        ctx.add_variable_from_value(
+            "ls",
+            (0..2_000)
+                .map(|_| Value::String(s.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let m: std::collections::HashMap<String, Value> = (0..128)
+            .map(|i| {
+                (
+                    format!("k{i}"),
+                    Value::from(format!("{i}{}", "v".repeat(8 * 1024))),
+                )
+            })
+            .collect();
+        ctx.add_variable_from_value("m", m);
+    }
+
+    #[test]
+    fn steps_budget_charges_deep_equality_and_membership() {
+        // Comparison walks the whole operands: a walk of the same depth is
+        // charged, capped at the steps left, before comparing.
+        let mut ctx = steps_budget(10_000);
+        deep_values(&mut ctx);
+        for src in [
+            "ls == ls",
+            "[ls] == [ls]",
+            "[ls, ls] != [ls, ls]",
+            "[m] == [m]",
+            "{'a': ls} == {'a': ls}",
+            "m in [m, m, m, m]",
+            "s in ls",
+            "[1].all(x, [ls] == [ls])",
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(run(&ctx, src), steps_exceeded(10_000), "{src}");
+            assert!(
+                started.elapsed() < Duration::from_millis(20),
+                "{src} took {:?}",
+                started.elapsed()
+            );
+        }
+        // small comparisons stay cheap
+        assert_eq!(run(&ctx, "[1, 2] == [1, 2] && 'k1' in m"), Ok(true.into()));
     }
 
     fn bytes_budget(max_bytes: u64) -> Context<'static, 'static> {

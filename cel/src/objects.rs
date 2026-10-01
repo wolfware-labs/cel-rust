@@ -5,7 +5,7 @@ use crate::common::types::optional::{unwrap_optional, Unwrapped};
 use crate::common::types::*;
 use crate::common::value::{BuiltinRef, CowVal, FromVal, StaticVal, Val};
 use crate::context::Context;
-use crate::runtime::Frame;
+use crate::runtime::{compare_size, Frame};
 use crate::{ExecutionError, Expression, FunctionContext};
 #[cfg(feature = "chrono")]
 use chrono::TimeZone;
@@ -1378,11 +1378,7 @@ impl Value {
                                     false,
                                 )
                             };
-                            if let Some(frame) = ctx.frame() {
-                                if let Some(list) = rhs.downcast_ref::<CelList>() {
-                                    frame.charge_steps(list.inner().len() as u64)?;
-                                }
-                            }
+                            charge_membership(ctx, lhs.as_ref(), rhs.as_ref())?;
                             let container = rhs.as_container().ok_or_else(overload_error)?;
                             return container
                                 .contains(lhs.as_ref())
@@ -1939,8 +1935,9 @@ fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), Executi
     }
 }
 
-/// Charges the steps of comparing two lists or two maps: one per element of
-/// the shorter.
+/// Charges the steps of comparing `lhs` with `rhs` deeply, see
+/// [`compare_size`]: the cheaper of the two walks, as a comparison stops at
+/// the end of the smaller operand.
 #[inline(always)]
 fn charge_equality(ctx: &Context, lhs: &dyn Val, rhs: &dyn Val) -> Result<(), ExecutionError> {
     match ctx.frame() {
@@ -1951,12 +1948,33 @@ fn charge_equality(ctx: &Context, lhs: &dyn Val, rhs: &dyn Val) -> Result<(), Ex
 
 #[inline(never)]
 fn equality_in(frame: &Frame, lhs: &dyn Val, rhs: &dyn Val) -> bool {
-    let len = match (lhs.as_builtin(), rhs.as_builtin()) {
-        (BuiltinRef::List(l), BuiltinRef::List(r)) => l.inner().len().min(r.inner().len()),
-        (BuiltinRef::Map(l), BuiltinRef::Map(r)) => l.inner().len().min(r.inner().len()),
-        _ => return true,
+    let cap = frame.steps_left();
+    let cost = compare_size(lhs, cap).min(compare_size(rhs, cap));
+    frame.add_steps(cost)
+}
+
+/// Charges the steps of `needle in container`: a list compares the needle
+/// with every element, at most the walk of the list; a map hashes the needle.
+#[inline(always)]
+fn charge_membership(
+    ctx: &Context,
+    needle: &dyn Val,
+    container: &dyn Val,
+) -> Result<(), ExecutionError> {
+    match ctx.frame() {
+        Some(frame) if !membership_in(frame, needle, container) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn membership_in(frame: &Frame, needle: &dyn Val, container: &dyn Val) -> bool {
+    let cap = frame.steps_left();
+    let cost = match container.as_builtin() {
+        BuiltinRef::List(_) => compare_size(container, cap),
+        _ => compare_size(needle, cap),
     };
-    frame.add_steps(len as u64)
+    frame.add_steps(cost)
 }
 
 /// The name of the function a call on `target` names when `target` spells a
