@@ -296,12 +296,25 @@ impl<'p, 'v> Context<'p, 'v> {
     /// limits and interrupt handle in force here, or `None` when there is
     /// nothing to enforce: no budget and no interrupt handle.
     pub(crate) fn new_frame(&self) -> Option<Frame<'v>> {
-        let options = self.budget();
         let interrupt = self.interrupt();
+        // the common case, checked without merging any options
+        if interrupt.is_none() && !self.sets_budget() && self.env().options().is_unbounded() {
+            return None;
+        }
+        let options = self.budget();
         if interrupt.is_none() && options.is_unbounded() {
             return None;
         }
         Some(Frame::new(&options, interrupt))
+    }
+
+    /// Whether this scope or one of its parents has options set with
+    /// [`set_budget`](Self::set_budget).
+    fn sets_budget(&self) -> bool {
+        match self {
+            Context::Root { budget, .. } => budget.is_some(),
+            Context::Child { budget, parent, .. } => budget.is_some() || parent.sets_budget(),
+        }
     }
 
     /// Creates a [`Frame`] for a new evaluation under this context even when
