@@ -734,7 +734,8 @@ pub(crate) fn fresh_size(value: &dyn Val) -> u64 {
 /// `Arc` (or borrow them), so a copy allocates nothing but its box, which is
 /// not charged. A struct copies its field table, [`MAP_SLOT`] per field.
 ///
-/// Values of other types are not charged. For the built-in scalars (`int`,
+/// Values of other types are not charged (and [`compare_size`] prices them
+/// at 0): see the cost section of the [`Val`] docs. For the built-in scalars (`int`,
 /// `bool`, `timestamp`, ...) and opaque values (an `Arc`) the copy is a
 /// small fixed-size box, paid for by the steps of the node that copies it.
 /// A custom [`Val`] decides in its own `clone_as_boxed` what a copy costs,
@@ -752,7 +753,8 @@ pub(crate) fn clone_size(value: &dyn Val) -> u64 {
 /// The steps comparing `value` with another value can cost, stopping once
 /// the count passes `cap`: one per list element or map entry, and one per 64
 /// bytes of every string or bytes value compared, recursively. Scalars and
-/// short strings cost nothing beyond the node that produced them.
+/// short strings cost nothing beyond the node that produced them, and so do
+/// custom [`Val`]s, whose comparison cost the interpreter cannot see.
 ///
 /// Equality and `in` compare deeply, so a few nodes can compare megabytes;
 /// the walk is charged before comparing, and capped so that it costs no more

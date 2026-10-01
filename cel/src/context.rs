@@ -202,7 +202,13 @@ impl<'p, 'v> Context<'p, 'v> {
     /// [`Env`]: every field left unset (zero, the default) is inherited, so a
     /// context can add a steps budget and keep the `Env`'s iteration budget.
     /// An inherited budget cannot be lifted by setting zero; set a larger
-    /// limit instead. [`budget`](Self::budget) returns the options in force.
+    /// limit instead.
+    ///
+    /// A limit set here replaces the inherited one, whether it is lower or
+    /// higher: a context can **loosen** an `Env` limit as well as tighten it.
+    /// The options are laid over the `Env`'s, not combined with the minimum.
+    /// Whoever can call `set_budget` on a context therefore controls its
+    /// evaluations' limits; the `Env` sets the defaults, not a ceiling. [`budget`](Self::budget) returns the options in force.
     /// One `Env` can thus be shared by contexts that each bound their
     /// evaluations differently.
     ///
