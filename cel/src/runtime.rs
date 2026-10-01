@@ -483,7 +483,8 @@ impl<'a> Frame<'a> {
     ///   `regex_cost::parse_steps`;
     /// - translating: priced from the parsed pattern before compiling, see
     ///   `regex_cost::translation_steps` (Unicode and Perl classes, and under
-    ///   `(?i)` the case folding of every Unicode class, range and literal);
+    ///   `(?i)` every case fold: of each Unicode class, and of each bracket
+    ///   and set operand, Perl classes, ranges and nested brackets included);
     /// - compiling: one step per 8 bytes of the compiled automaton, or of the
     ///   size limit when the compile fails for size, as the work up to the
     ///   limit was done anyway;
@@ -1179,6 +1180,38 @@ mod tests {
                 "{head} ({len} bytes): {shown}"
             );
         }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_regex_refolds_and_age_classes() {
+        // Each takes 40-60 ms to translate in release, over 500,000 steps at
+        // the reference 80 ns: a single call must not fit in 200,000.
+        let mut failed = vec![];
+        for pattern in [
+            // under (?i), every set operation folds its Perl class operand
+            format!("(?i)[{}\\w]", r"\w&&".repeat(100)),
+            r"(?i:[\w--\d])".repeat(50),
+            // every nested bracket refolds all it contains
+            format!("(?i)[{}\\w{}]", "a[".repeat(120), "]".repeat(120)),
+            // an Age class unions the tables of every earlier version
+            format!("[{}]", r"\p{Age=15.0}".repeat(200)),
+        ] {
+            let limit = 200_000;
+            let mut ctx = with_options(
+                RuntimeOptions::default()
+                    .with_max_steps(limit)
+                    .with_regex_size_limit(1 << 20),
+            );
+            ctx.add_variable("p", pattern.clone()).unwrap();
+            let head: std::string::String = pattern.chars().take(24).collect();
+            let result = run(&ctx, "'a'.matches(p)");
+            if result != steps_exceeded(limit) {
+                let shown: std::string::String = format!("{result:?}").chars().take(80).collect();
+                failed.push(format!("{head}: {shown}"));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
     }
 
     #[cfg(feature = "regex")]
