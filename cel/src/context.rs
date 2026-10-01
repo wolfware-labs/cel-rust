@@ -206,6 +206,13 @@ impl<'p, 'v> Context<'p, 'v> {
     /// One `Env` can thus be shared by contexts that each bound their
     /// evaluations differently.
     ///
+    /// The options are read once, when an evaluation starts. Setting them on
+    /// a scope derived from a context that is being evaluated (say, in a
+    /// custom function evaluating a nested program through
+    /// [`FunctionContext::ptx`](crate::FunctionContext::ptx)) has no effect on
+    /// that evaluation: the nested program shares the running evaluation's
+    /// frame, and with it the budget the evaluation started with.
+    ///
     /// # Example
     /// ```
     /// use cel::{BudgetKind, Context, Env, ExecutionError, Program, RuntimeOptions};

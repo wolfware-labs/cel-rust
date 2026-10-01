@@ -1291,6 +1291,20 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_set_inside_a_running_evaluation_has_no_effect() {
+        fn loosen(ftx: &FunctionContext) -> ResolveResult {
+            let mut scope = ftx.ptx.new_inner_scope();
+            scope.set_budget(RuntimeOptions::default().with_max_steps(1_000_000));
+            Program::compile("[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(x, x > 0)")
+                .unwrap()
+                .execute(&scope)
+        }
+        let mut ctx = steps_budget(20);
+        ctx.add_function("loosen", loosen).unwrap();
+        assert_eq!(run(&ctx, "loosen()"), steps_exceeded(20));
+    }
+
+    #[test]
     fn nearest_scope_budget_applies() {
         let mut root = Context::default();
         root.set_budget(RuntimeOptions::default().with_max_steps(2));
