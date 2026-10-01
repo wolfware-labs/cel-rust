@@ -47,7 +47,33 @@ impl From<f32> for Value {
 /// resolved argument into a primitive type, e.g. `CelInt -> i64`. This trait is
 /// auto-implemented for many CEL-primitive types.
 pub(crate) trait FromVal: Sized {
+    /// Whether extracting `Self` converts the value into a [`Value`], which
+    /// rebuilds its lists and maps: such an extraction is charged against the
+    /// bytes budget. Extracting a primitive or an `Arc` is O(1) and free.
+    const CONVERTS: bool = false;
+
     fn from_val(value: &dyn Val) -> Result<Self, ExecutionError>;
+}
+
+/// Charges the bytes of converting the argument `value` of a function into a
+/// [`Value`] against the budget of the evaluation calling it.
+pub(crate) fn charge_conversion(
+    ctx: &FunctionContext,
+    value: &dyn Val,
+) -> Result<(), ExecutionError> {
+    match ctx.ptx.frame() {
+        Some(frame) => frame.charge_conversion(value),
+        None => Ok(()),
+    }
+}
+
+/// Extracts `T` from the argument `value` of a function, charging the
+/// conversion when there is one.
+fn extract<T: FromVal>(ctx: &FunctionContext, value: &dyn Val) -> Result<T, ExecutionError> {
+    if T::CONVERTS {
+        charge_conversion(ctx, value)?;
+    }
+    T::from_val(value)
 }
 
 fn downcast_or_unexpected<'a, 'v, T: DowncastFrom<'a, 'v>>(
@@ -63,6 +89,8 @@ fn downcast_or_unexpected<'a, 'v, T: DowncastFrom<'a, 'v>>(
 }
 
 impl FromVal for Value {
+    const CONVERTS: bool = true;
+
     fn from_val(value: &dyn Val) -> Result<Self, ExecutionError> {
         value.try_into()
     }
@@ -125,6 +153,8 @@ impl FromVal for chrono::DateTime<chrono::FixedOffset> {
 }
 
 impl FromVal for Arc<Vec<Value>> {
+    const CONVERTS: bool = true;
+
     fn from_val(value: &dyn Val) -> Result<Self, ExecutionError> {
         match Value::from_val(value)? {
             Value::List(list) => Ok(list),
@@ -137,6 +167,8 @@ impl FromVal for Arc<Vec<Value>> {
 }
 
 impl FromVal for Arc<dyn Opaque> {
+    const CONVERTS: bool = true;
+
     fn from_val(value: &dyn Val) -> Result<Self, ExecutionError> {
         match Value::from_val(value)? {
             Value::Opaque(opaque) => Ok(opaque),
@@ -149,6 +181,8 @@ impl FromVal for Arc<dyn Opaque> {
 }
 
 impl<T: FromVal> FromVal for Option<T> {
+    const CONVERTS: bool = T::CONVERTS;
+
     fn from_val(value: &dyn Val) -> Result<Self, ExecutionError> {
         if value.downcast_ref::<CelNull>().is_some() {
             Ok(None)
@@ -183,7 +217,7 @@ impl<'a, 'context, 'call> FromContext<'a, 'context, 'call> for Arc<Vec<Value>> {
     where
         Self: Sized,
     {
-        arg_val_from_context(ctx).and_then(|v| FromVal::from_val(v.as_ref()))
+        arg_val_from_context(ctx).and_then(|v| extract(ctx, v.as_ref()))
     }
 }
 
@@ -212,7 +246,7 @@ impl<'a, 'context, 'call> FromContext<'a, 'context, 'call> for Arc<dyn Opaque> {
     where
         Self: Sized,
     {
-        arg_val_from_context(ctx).and_then(|v| FromVal::from_val(v.as_ref()))
+        arg_val_from_context(ctx).and_then(|v| extract(ctx, v.as_ref()))
     }
 }
 
@@ -334,11 +368,11 @@ where
         Self: Sized,
     {
         if let Some(ref this) = ctx.this {
-            Ok(This(T::from_val(this.as_ref())?))
+            Ok(This(extract(ctx, this.as_ref())?))
         } else {
             let arg = arg_val_from_context(ctx)
                 .map_err(|_| ExecutionError::missing_argument_or_target())?;
-            Ok(This(T::from_val(arg.as_ref())?))
+            Ok(This(extract(ctx, arg.as_ref())?))
         }
     }
 }
@@ -429,7 +463,7 @@ impl<'a, 'context, 'call> FromContext<'a, 'context, 'call> for Value {
     where
         Self: Sized,
     {
-        arg_val_from_context(ctx).and_then(|v| FromVal::from_val(v.as_ref()))
+        arg_val_from_context(ctx).and_then(|v| extract(ctx, v.as_ref()))
     }
 }
 

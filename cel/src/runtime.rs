@@ -16,6 +16,7 @@
 //! Unlike ordinary CEL errors, these are never absorbed by `||`, `&&`, or
 //! optional accessors: once tripped, the evaluation as a whole fails.
 
+use crate::common::value::{BuiltinRef, Val};
 use crate::ExecutionError;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -287,6 +288,7 @@ pub struct Frame<'a> {
     max_steps: u64,
     steps: AtomicU64,
     max_bytes: u64,
+    bytes: AtomicU64,
 }
 
 impl<'a> Frame<'a> {
@@ -301,6 +303,7 @@ impl<'a> Frame<'a> {
             max_steps: options.max_steps,
             steps: AtomicU64::new(0),
             max_bytes: options.max_bytes,
+            bytes: AtomicU64::new(0),
         }
     }
 
@@ -344,6 +347,47 @@ impl<'a> Frame<'a> {
             ABORT_NONE => Ok(()),
             _ => Err(self.abort_error().expect("an abort is recorded")),
         }
+    }
+
+    /// Charges `bytes` allocated bytes against the bytes budget.
+    ///
+    /// Fails once the budget is exceeded, and on every call after any abort
+    /// has been recorded.
+    #[inline(always)]
+    pub(crate) fn charge_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
+        let total = self.bytes.load(Ordering::Relaxed).saturating_add(bytes);
+        self.bytes.store(total, Ordering::Relaxed);
+        if self.max_bytes > 0 && total > self.max_bytes {
+            self.record(ABORT_BYTES);
+        }
+        match self.abort.load(Ordering::Relaxed) {
+            ABORT_NONE => Ok(()),
+            _ => Err(self.abort_error().expect("an abort is recorded")),
+        }
+    }
+
+    /// Charges the bytes of creating `value`, see [`fresh_size`].
+    #[inline(always)]
+    pub(crate) fn charge_fresh(&self, value: &dyn Val) -> Result<(), ExecutionError> {
+        self.charge_bytes(fresh_size(value))
+    }
+
+    /// Charges the bytes of copying `value`, see [`clone_size`].
+    #[inline(always)]
+    pub(crate) fn charge_clone(&self, value: &dyn Val) -> Result<(), ExecutionError> {
+        self.charge_bytes(clone_size(value))
+    }
+
+    /// Charges the bytes of converting `value` into a [`Value`](crate::Value),
+    /// see [`conversion_size`]. The walk stops once it passes the budget left,
+    /// so a value sharing a large one many times is refused before it is
+    /// converted, not after.
+    pub(crate) fn charge_conversion(&self, value: &dyn Val) -> Result<(), ExecutionError> {
+        let cap = match self.max_bytes {
+            0 => u64::MAX,
+            max => max.saturating_sub(self.bytes.load(Ordering::Relaxed)),
+        };
+        self.charge_bytes(conversion_size(value, cap))
     }
 
     /// Polls the interrupt handle directly, bypassing the frequency gate.
@@ -406,6 +450,102 @@ impl<'a> Frame<'a> {
             _ => None,
         }
     }
+}
+
+/// Bytes charged per list element: the `Box<dyn Val>` it occupies.
+const LIST_SLOT: u64 = 16;
+/// Bytes charged per map entry: its key, its value's box and table overhead.
+const MAP_SLOT: u64 = 64;
+/// Bytes charged per list element when a list is converted into a [`Value`](crate::Value).
+const VALUE_SLOT: u64 = std::mem::size_of::<crate::Value>() as u64;
+/// Bytes charged for an optional converted into a [`Value`](crate::Value): its `Arc`.
+const OPTIONAL_SLOT: u64 = 16;
+
+/// The bytes a freshly created value allocated at its top level: a string or
+/// bytes its length, a list [`LIST_SLOT`] per element, a map [`MAP_SLOT`] per
+/// entry, a struct [`MAP_SLOT`] per field, scalars nothing. Elements were
+/// charged when they were created themselves.
+pub(crate) fn fresh_size(value: &dyn Val) -> u64 {
+    match value.as_builtin() {
+        BuiltinRef::String(s) => s.inner().len() as u64,
+        BuiltinRef::Bytes(b) => b.inner().len() as u64,
+        BuiltinRef::List(l) => l.inner().len() as u64 * LIST_SLOT,
+        BuiltinRef::Map(m) => m.inner().len() as u64 * MAP_SLOT,
+        #[cfg(feature = "structs")]
+        BuiltinRef::Struct(s) => s.field_count() as u64 * MAP_SLOT,
+        _ => 0,
+    }
+}
+
+/// The bytes [`Val::clone_as_boxed`] copies for `value`: O(1).
+///
+/// Strings, bytes, lists, maps and optionals share their contents behind an
+/// `Arc` (or borrow them), so a copy allocates nothing but its box, which is
+/// not charged. A struct copies its field table, [`MAP_SLOT`] per field.
+/// Values of other types are not charged: their cost is unknown.
+pub(crate) fn clone_size(value: &dyn Val) -> u64 {
+    match value.as_builtin() {
+        #[cfg(feature = "structs")]
+        BuiltinRef::Struct(s) => s.field_count() as u64 * MAP_SLOT,
+        _ => 0,
+    }
+}
+
+/// The bytes converting `value` into a [`Value`](crate::Value) allocates,
+/// stopping once the count passes `cap`.
+///
+/// The conversion rebuilds every list and map ([`VALUE_SLOT`] per list
+/// element, [`MAP_SLOT`] per map entry) and copies borrowed strings and bytes,
+/// while shared ones are not copied. It visits a value shared `n` times `n`
+/// times, which is why the walk is capped: it runs before the conversion.
+pub(crate) fn conversion_size(value: &dyn Val, cap: u64) -> u64 {
+    fn walk(value: &dyn Val, cap: u64, total: &mut u64) {
+        if *total > cap {
+            return;
+        }
+        match value.as_builtin() {
+            BuiltinRef::String(s) if s.as_arc().is_none() => *total += s.inner().len() as u64,
+            BuiltinRef::Bytes(b) if b.as_arc().is_none() => *total += b.inner().len() as u64,
+            BuiltinRef::List(l) => {
+                *total += l.inner().len() as u64 * VALUE_SLOT;
+                for item in l.inner() {
+                    walk(item.as_ref(), cap, total);
+                    if *total > cap {
+                        return;
+                    }
+                }
+            }
+            BuiltinRef::Map(m) => {
+                *total += m.inner().len() as u64 * MAP_SLOT;
+                for item in m.inner().values() {
+                    walk(item.as_ref(), cap, total);
+                    if *total > cap {
+                        return;
+                    }
+                }
+            }
+            BuiltinRef::Optional(o) => {
+                *total += OPTIONAL_SLOT;
+                if let Some(inner) = o.option() {
+                    walk(inner, cap, total);
+                }
+            }
+            #[cfg(feature = "structs")]
+            BuiltinRef::Struct(s) => {
+                *total += s.field_count() as u64 * MAP_SLOT;
+                for item in s.fields() {
+                    walk(item, cap, total);
+                    if *total > cap {
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut total = 0;
+    walk(value, cap, &mut total);
+    total
 }
 
 #[cfg(test)]
@@ -520,6 +660,115 @@ mod tests {
         let mut ctx = steps_budget(500);
         ctx.add_variable("s", "x".repeat(64 * 1_000)).unwrap();
         assert_eq!(run(&ctx, "s.matches('y')"), steps_exceeded(500));
+    }
+
+    fn bytes_budget(max_bytes: u64) -> Context<'static, 'static> {
+        let mut ctx = with_options(RuntimeOptions::default().with_max_bytes(max_bytes));
+        ctx.add_variable("s", "x".repeat(1_000)).unwrap();
+        ctx.add_variable("l", (0..1_000i64).collect::<Vec<_>>())
+            .unwrap();
+        ctx
+    }
+
+    fn bytes_exceeded(limit: u64) -> ResolveResult {
+        Err(ExecutionError::BudgetExceeded {
+            kind: BudgetKind::Bytes,
+            limit,
+        })
+    }
+
+    #[test]
+    fn bytes_budget_charges_created_strings() {
+        // the concatenation allocates 2000 bytes
+        assert_eq!(run(&bytes_budget(2_100), "size(s + s)"), Ok(2_000.into()));
+        assert_eq!(
+            run(&bytes_budget(1_900), "size(s + s)"),
+            bytes_exceeded(1_900)
+        );
+    }
+
+    #[test]
+    fn bytes_budget_charges_created_lists_and_maps() {
+        // 1000 + 1000 elements of 16 bytes
+        assert_eq!(run(&bytes_budget(33_000), "size(l + l)"), Ok(2_000.into()));
+        assert_eq!(
+            run(&bytes_budget(31_000), "size(l + l)"),
+            bytes_exceeded(31_000)
+        );
+        // a list literal: 16 bytes per element
+        assert_eq!(
+            run(&bytes_budget(100), "size([1, 2, 3, 4, 5, 6, 7, 8])"),
+            bytes_exceeded(100)
+        );
+        assert_eq!(
+            run(&bytes_budget(200), "size([1, 2, 3, 4, 5, 6, 7, 8])"),
+            Ok(8.into())
+        );
+        // a map literal: 64 bytes per entry
+        assert_eq!(
+            run(&bytes_budget(100), "size({1: 1, 2: 2})"),
+            bytes_exceeded(100)
+        );
+        assert_eq!(run(&bytes_budget(200), "size({1: 1, 2: 2})"), Ok(2.into()));
+    }
+
+    #[test]
+    fn bytes_budget_charges_map_and_filter_results() {
+        // one `[x]` of 16 bytes per element
+        assert_eq!(
+            run(&bytes_budget(10_000), "size(l.map(x, x))"),
+            bytes_exceeded(10_000)
+        );
+        assert_eq!(
+            run(&bytes_budget(10_000), "size(l.filter(x, true))"),
+            bytes_exceeded(10_000)
+        );
+        assert_eq!(
+            run(&bytes_budget(20_000), "size(l.map(x, x))"),
+            Ok(1_000.into())
+        );
+    }
+
+    #[test]
+    fn bytes_budget_does_not_charge_sharing() {
+        // `[l, l, l]` shares `l`: three slots, no copy of its elements
+        assert_eq!(run(&bytes_budget(100), "size([l, l, l])"), Ok(3.into()));
+        assert_eq!(run(&bytes_budget(100), "size([s, s, s])"), Ok(3.into()));
+    }
+
+    #[test]
+    fn bytes_budget_charges_the_result_conversion() {
+        // returning `l` builds a `Value` list of 1000 elements
+        assert_eq!(run(&bytes_budget(1_000), "l"), bytes_exceeded(1_000));
+        // a result sharing `l` a thousand times would build a million values:
+        // the conversion is refused before it is made
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run(&bytes_budget(1_000_000), "l.map(x, l)"),
+            bytes_exceeded(1_000_000)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bytes_budget_charges_function_results_and_arguments() {
+        fn big(ftx: &FunctionContext) -> ResolveResult {
+            let _ = ftx;
+            Ok(Value::String(Arc::new("y".repeat(5_000))))
+        }
+        fn length(v: Value) -> i64 {
+            match v {
+                Value::List(l) => l.len() as i64,
+                _ => -1,
+            }
+        }
+        let mut ctx = bytes_budget(4_000);
+        ctx.add_function("big", big).unwrap();
+        ctx.add_function("length", length).unwrap();
+        assert_eq!(run(&ctx, "size(big())"), bytes_exceeded(4_000));
+        // converting `l` into a `Value` argument builds a 1000 element list
+        assert_eq!(run(&ctx, "length(l)"), bytes_exceeded(4_000));
+        assert_eq!(run(&ctx, "length([1])"), Ok(1.into()));
     }
 
     #[test]
