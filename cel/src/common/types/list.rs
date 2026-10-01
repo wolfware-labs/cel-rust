@@ -311,9 +311,8 @@ impl<'b, 'v: 'w, 'w> traits::Iterator<'b, 'w> for SliceIterator<'b, 'v> {
 /// of the loop and never binds it to a variable, so no expression can observe
 /// it half-built. Appending goes through [`MutableList::extend_owned`], which
 /// moves the elements of a freshly built list in, or [`MutableList::extend`],
-/// rather than
-/// [`Adder`], because growing the list in place is only sound for elements
-/// that live as long as the list does (`'v`), which the generic
+/// rather than [`Adder`], because growing the list in place is only sound for
+/// elements that live as long as the list does (`'v`), which the generic
 /// `Adder::add<'b, 'w>` cannot express. When the loop completes, the
 /// evaluator converts it into a [`DefaultList`] via
 /// [`MutableList::to_immutable`].

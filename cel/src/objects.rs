@@ -2727,8 +2727,6 @@ mod tests {
         assert!(result.is_err(), "Should error on missing map key");
     }
 
-    /// `has()` asks whether the value has the field, whatever its kind: as
-    /// cel-go's `refQualify` does, it goes by what the value can do.
     /// Strings, bytes, lists and maps are shared with the [`Value`]s they are
     /// converted from and to, not copied.
     mod sharing {
@@ -2878,6 +2876,8 @@ mod tests {
         }
     }
 
+    /// `has()` asks whether the value has the field, whatever its kind: as
+    /// cel-go's `refQualify` does, it goes by what the value can do.
     mod presence {
         use crate::common::traits::Indexer;
         use crate::common::types::{CelString, Kind, Type};

@@ -291,8 +291,9 @@ impl<'a, 'v> TryFrom<&'a (dyn Val + 'v)> for &'a str {
     }
 }
 
-/// Takes the string out of `arg`: a move for an owned box, a cheap clone of
-/// the `Cow` for a borrowed one. Hands `arg` back when it is not a string.
+/// Takes the string out of `arg`: a move for an owned box, an O(1) clone (of
+/// the borrow or of the shared `Arc`) for a borrowed one. Hands `arg` back
+/// when it is not a string.
 pub(crate) fn take_string<'b, 'v>(arg: CowVal<'b, 'v>) -> Result<String<'v>, CowVal<'b, 'v>> {
     match arg {
         CowVal::Borrowed(v) => v
