@@ -384,51 +384,89 @@ impl<'a> Frame<'a> {
         }
     }
 
-    /// Charges `steps` evaluation steps against the steps budget.
+    // The hot charges below report success as a `bool` and leave building the
+    // error to the cold `exceeded`: a `Result` would cost every interpreter
+    // node a large return slot even when no frame exists.
+
+    /// Charges the step of evaluating one expression node. Returns `false`
+    /// once the evaluation must stop, the error then being
+    /// [`exceeded`](Self::exceeded).
     ///
-    /// Fails once the budget is exceeded, and on every call after any abort
-    /// has been recorded. Evaluation is single-threaded, so a relaxed load and
-    /// store suffice: no read-modify-write is needed.
+    /// Evaluation is single-threaded, so a relaxed load and store suffice: no
+    /// read-modify-write is needed.
     #[inline(always)]
-    pub(crate) fn charge_steps(&self, steps: u64) -> Result<(), ExecutionError> {
+    pub(crate) fn step(&self) -> bool {
+        // cannot overflow: a u64 of steps is centuries of evaluation
+        let total = self.steps.load(Ordering::Relaxed) + 1;
+        self.steps.store(total, Ordering::Relaxed);
+        (self.max_steps == 0 || total <= self.max_steps)
+            && self.abort.load(Ordering::Relaxed) == ABORT_NONE
+    }
+
+    /// Charges `steps` evaluation steps, see [`step`](Self::step).
+    #[inline(never)]
+    pub(crate) fn add_steps(&self, steps: u64) -> bool {
         let total = self.steps.load(Ordering::Relaxed).saturating_add(steps);
         self.steps.store(total, Ordering::Relaxed);
         if self.max_steps > 0 && total > self.max_steps {
             self.record(ABORT_STEPS);
         }
-        match self.abort.load(Ordering::Relaxed) {
-            ABORT_NONE => Ok(()),
-            _ => Err(self.abort_error().expect("an abort is recorded")),
-        }
+        self.abort.load(Ordering::Relaxed) == ABORT_NONE
     }
 
-    /// Charges `bytes` allocated bytes against the bytes budget.
-    ///
-    /// Fails once the budget is exceeded, and on every call after any abort
-    /// has been recorded.
-    #[inline(always)]
-    pub(crate) fn charge_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
+    /// Charges `bytes` allocated bytes against the bytes budget. Returns
+    /// `false` once the evaluation must stop, the error then being
+    /// [`exceeded`](Self::exceeded).
+    #[inline(never)]
+    pub(crate) fn add_bytes(&self, bytes: u64) -> bool {
         let total = self.bytes.load(Ordering::Relaxed).saturating_add(bytes);
         self.bytes.store(total, Ordering::Relaxed);
         if self.max_bytes > 0 && total > self.max_bytes {
             self.record(ABORT_BYTES);
         }
-        match self.abort.load(Ordering::Relaxed) {
-            ABORT_NONE => Ok(()),
-            _ => Err(self.abort_error().expect("an abort is recorded")),
+        self.abort.load(Ordering::Relaxed) == ABORT_NONE
+    }
+
+    /// Charges the bytes of creating `value`, see [`fresh_size`] and
+    /// [`add_bytes`](Self::add_bytes).
+    #[inline(never)]
+    pub(crate) fn add_fresh(&self, value: &dyn Val) -> bool {
+        self.add_bytes(fresh_size(value))
+    }
+
+    /// Charges the bytes of copying `value`, see [`clone_size`] and
+    /// [`add_bytes`](Self::add_bytes).
+    #[inline(never)]
+    pub(crate) fn add_clone(&self, value: &dyn Val) -> bool {
+        self.add_bytes(clone_size(value))
+    }
+
+    /// The error of an evaluation a charge has stopped: the abort recorded,
+    /// recording first the steps overrun [`step`](Self::step) leaves to it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn exceeded(&self) -> ExecutionError {
+        if self.max_steps > 0 && self.steps.load(Ordering::Relaxed) > self.max_steps {
+            self.record(ABORT_STEPS);
+        }
+        self.abort_error()
+            .expect("a stopped evaluation has an abort")
+    }
+
+    /// Charges `steps` evaluation steps, failing as [`step`](Self::step) does.
+    pub(crate) fn charge_steps(&self, steps: u64) -> Result<(), ExecutionError> {
+        match self.add_steps(steps) {
+            true => Ok(()),
+            false => Err(self.exceeded()),
         }
     }
 
-    /// Charges the bytes of creating `value`, see [`fresh_size`].
-    #[inline(always)]
-    pub(crate) fn charge_fresh(&self, value: &dyn Val) -> Result<(), ExecutionError> {
-        self.charge_bytes(fresh_size(value))
-    }
-
-    /// Charges the bytes of copying `value`, see [`clone_size`].
-    #[inline(always)]
-    pub(crate) fn charge_clone(&self, value: &dyn Val) -> Result<(), ExecutionError> {
-        self.charge_bytes(clone_size(value))
+    /// Charges `bytes` allocated bytes, failing as [`add_bytes`](Self::add_bytes) does.
+    pub(crate) fn charge_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
+        match self.add_bytes(bytes) {
+            true => Ok(()),
+            false => Err(self.exceeded()),
+        }
     }
 
     /// Charges the bytes of converting `value` into a [`Value`](crate::Value),

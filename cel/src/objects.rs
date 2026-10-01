@@ -1105,7 +1105,9 @@ impl Value {
         ctx: &'e Context<'p, 'v>,
     ) -> Result<CowVal<'e, 'v>, ExecutionError> {
         if let Some(frame) = ctx.frame() {
-            frame.charge_steps(1)?;
+            if !frame.step() {
+                return Err(frame.exceeded());
+            }
         }
         match &expr.expr {
             Expr::Literal(literal) => Ok(literal.to_val()),
@@ -1824,7 +1826,9 @@ fn owned<'v>(
     value: CowVal<'_, 'v>,
 ) -> Result<Box<dyn Val + 'v>, ExecutionError> {
     if let (Some(frame), CowVal::Borrowed(v)) = (frame, &value) {
-        frame.charge_clone(*v)?;
+        if !frame.add_clone(*v) {
+            return Err(frame.exceeded());
+        }
     }
     Ok(value.into_owned())
 }
@@ -1836,7 +1840,9 @@ fn owned_item<'v>(
     item: &(dyn Val + 'v),
 ) -> Result<Box<dyn Val + 'v>, ExecutionError> {
     if let Some(frame) = frame {
-        frame.charge_clone(item)?;
+        if !frame.add_clone(item) {
+            return Err(frame.exceeded());
+        }
     }
     Ok(item.clone_as_boxed())
 }
@@ -1850,7 +1856,9 @@ fn charge_fresh<'b, 'v>(
     value: CowVal<'b, 'v>,
 ) -> Result<CowVal<'b, 'v>, ExecutionError> {
     if let (Some(frame), CowVal::Owned(v)) = (frame, &value) {
-        frame.charge_fresh(v.as_ref())?;
+        if !frame.add_fresh(v.as_ref()) {
+            return Err(frame.exceeded());
+        }
     }
     Ok(value)
 }
@@ -1865,7 +1873,9 @@ fn owned_fresh<'v>(
     match value {
         CowVal::Owned(v) => {
             if let Some(frame) = frame {
-                frame.charge_fresh(v.as_ref())?;
+                if !frame.add_fresh(v.as_ref()) {
+                    return Err(frame.exceeded());
+                }
             }
             Ok(v)
         }
@@ -1887,9 +1897,14 @@ fn charge_conversion(frame: Option<&Frame<'_>>, value: &dyn Val) -> Result<(), E
 /// grows with it.
 #[inline(always)]
 fn charge_dispatch(ctx: &Context, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
-    let Some(frame) = ctx.frame() else {
-        return Ok(());
-    };
+    match ctx.frame() {
+        Some(frame) if !dispatch_in(frame, name, args) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> bool {
     let scan = match name {
         "contains" | "startsWith" | "endsWith" | "matches" => args
             .first()
@@ -1897,22 +1912,27 @@ fn charge_dispatch(ctx: &Context, name: &str, args: &[CowVal]) -> Result<(), Exe
             .map_or(0, |subject| subject.inner().len() as u64 / 64 + 1),
         _ => 0,
     };
-    frame.charge_steps(1 + scan)
+    frame.add_steps(1 + scan)
 }
 
 /// Charges the steps of comparing two lists or two maps: one per element of
 /// the shorter.
 #[inline(always)]
 fn charge_equality(ctx: &Context, lhs: &dyn Val, rhs: &dyn Val) -> Result<(), ExecutionError> {
-    let Some(frame) = ctx.frame() else {
-        return Ok(());
-    };
+    match ctx.frame() {
+        Some(frame) if !equality_in(frame, lhs, rhs) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn equality_in(frame: &Frame, lhs: &dyn Val, rhs: &dyn Val) -> bool {
     let len = match (lhs.as_builtin(), rhs.as_builtin()) {
         (BuiltinRef::List(l), BuiltinRef::List(r)) => l.inner().len().min(r.inner().len()),
         (BuiltinRef::Map(l), BuiltinRef::Map(r)) => l.inner().len().min(r.inner().len()),
-        _ => return Ok(()),
+        _ => return true,
     };
-    frame.charge_steps(len as u64)
+    frame.add_steps(len as u64)
 }
 
 /// The name of the function a call on `target` names when `target` spells a
