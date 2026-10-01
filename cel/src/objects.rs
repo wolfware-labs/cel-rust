@@ -1065,6 +1065,9 @@ impl Value {
         expr: &'e Expression,
         ctx: &'e Context<'p, 'v>,
     ) -> Result<CowVal<'e, 'v>, ExecutionError> {
+        if let Some(frame) = ctx.frame() {
+            frame.charge_steps(1)?;
+        }
         match &expr.expr {
             Expr::Literal(literal) => Ok(literal.to_val()),
             Expr::Call(call) => {
@@ -1124,16 +1127,16 @@ impl Value {
                             };
                         }
                         operators::EQUALS => {
-                            return Ok(bool(
-                                Value::resolve_val(&call.args[0], ctx)?
-                                    == Value::resolve_val(&call.args[1], ctx)?,
-                            ))
+                            let lhs = Value::resolve_val(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
+                            return Ok(bool(lhs == rhs));
                         }
                         operators::NOT_EQUALS => {
-                            return Ok(bool(
-                                Value::resolve_val(&call.args[0], ctx)?
-                                    != Value::resolve_val(&call.args[1], ctx)?,
-                            ))
+                            let lhs = Value::resolve_val(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
+                            return Ok(bool(lhs != rhs));
                         }
                         operators::INDEX | operators::OPT_INDEX => {
                             let mut is_optional = call.func_name == operators::OPT_INDEX;
@@ -1334,6 +1337,11 @@ impl Value {
                                     false,
                                 )
                             };
+                            if let Some(frame) = ctx.frame() {
+                                if let Some(list) = rhs.downcast_ref::<CelList>() {
+                                    frame.charge_steps(list.inner().len() as u64)?;
+                                }
+                            }
                             let container = rhs.as_container().ok_or_else(overload_error)?;
                             return container
                                 .contains(lhs.as_ref())
@@ -1409,6 +1417,7 @@ impl Value {
                         }
                         let target = Value::resolve_val(target_expr, ctx)?;
                         args.insert(0, target);
+                        charge_dispatch(ctx, &call.func_name, &args)?;
                         if let Some(op) = ctx.env().find_member_overload(&call.func_name, &args) {
                             return op(args);
                         }
@@ -1744,6 +1753,7 @@ fn call_function<'e, 'p, 'v>(
     ftx_name: &'e str,
     args: Vec<CowVal<'e, 'v>>,
 ) -> Result<CowVal<'e, 'v>, ExecutionError> {
+    charge_dispatch(ctx, ftx_name, &args)?;
     if let Some(op) = ctx.env().find_overload(name, &args) {
         return op(args);
     }
@@ -1762,6 +1772,39 @@ fn call_function<'e, 'p, 'v>(
     };
     let mut ctx = FunctionContext::new(ftx_name, None, ctx, args);
     (func)(&mut ctx)
+}
+
+/// Charges the steps of dispatching the function `name` on `args`: one, plus
+/// one per 64 bytes of the string searched by the string functions whose cost
+/// grows with it.
+#[inline(always)]
+fn charge_dispatch(ctx: &Context, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
+    let Some(frame) = ctx.frame() else {
+        return Ok(());
+    };
+    let scan = match name {
+        "contains" | "startsWith" | "endsWith" | "matches" => args
+            .first()
+            .and_then(|subject| subject.downcast_ref::<CelString>())
+            .map_or(0, |subject| subject.inner().len() as u64 / 64 + 1),
+        _ => 0,
+    };
+    frame.charge_steps(1 + scan)
+}
+
+/// Charges the steps of comparing two lists or two maps: one per element of
+/// the shorter.
+#[inline(always)]
+fn charge_equality(ctx: &Context, lhs: &dyn Val, rhs: &dyn Val) -> Result<(), ExecutionError> {
+    let Some(frame) = ctx.frame() else {
+        return Ok(());
+    };
+    let len = match (lhs.as_builtin(), rhs.as_builtin()) {
+        (BuiltinRef::List(l), BuiltinRef::List(r)) => l.inner().len().min(r.inner().len()),
+        (BuiltinRef::Map(l), BuiltinRef::Map(r)) => l.inner().len().min(r.inner().len()),
+        _ => return Ok(()),
+    };
+    frame.charge_steps(len as u64)
 }
 
 /// The name of the function a call on `target` names when `target` spells a
