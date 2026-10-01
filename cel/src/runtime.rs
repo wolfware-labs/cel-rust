@@ -478,6 +478,9 @@ impl<'a> Frame<'a> {
     /// same), bounded by [`RuntimeOptions::with_regex_size_limit`]. The
     /// charges are calibrated on measured CPU, about 80 ns per step:
     ///
+    /// - translating: priced from the parsed pattern before compiling, see
+    ///   `regex_cost::translation_steps` (Unicode and Perl classes, and under
+    ///   `(?i)` the case folding of every Unicode class, range and literal);
     /// - compiling: one step per 8 bytes of the compiled automaton, or of the
     ///   size limit when the compile fails for size, as the work up to the
     ///   limit was done anyway;
@@ -487,6 +490,13 @@ impl<'a> Frame<'a> {
     #[cfg(feature = "regex")]
     pub(crate) fn is_match(&self, subject: &str, pattern: &str) -> Result<bool, ExecutionError> {
         use regex_automata::{meta, util::syntax, MatchKind};
+        // translating the pattern, priced from its syntax before it runs
+        if !self.add_steps(crate::regex_cost::translation_steps(
+            pattern,
+            self.steps_left(),
+        )) {
+            return Err(self.exceeded());
+        }
         // `regex::RegexBuilder`'s defaults
         const NFA_SIZE_LIMIT: usize = 10 << 20;
         const DFA_SIZE_LIMIT: usize = 2 << 20;
@@ -1090,6 +1100,46 @@ mod tests {
             ),
             Ok(true.into())
         );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_regex_translation() {
+        // Long or case-insensitive Unicode classes cost far more to translate
+        // than their small compiled automata suggest: priced from the syntax,
+        // before compiling, with or without a pattern length cap.
+        for max_regex_len in [0, 512] {
+            for pattern in [
+                format!("(?i)[{}]", r"\p{Lu}".repeat(200)),
+                format!("(?i)[{}]", r"\p{Greek}".repeat(113)),
+                format!("(?i)[{}]", r"\p{Greek}".repeat(12_800)),
+                format!("[{}]", r"\p{L}".repeat(12_800)),
+                r"(?i)\p{Lu}".to_owned(),
+                r"(?i)[\p{Any}]".to_owned(),
+            ] {
+                let mut ctx = with_options(
+                    RuntimeOptions::default()
+                        .with_max_steps(10_000)
+                        .with_regex_size_limit(1 << 20)
+                        .with_max_regex_len(max_regex_len),
+                );
+                ctx.add_variable("p", pattern.clone()).unwrap();
+                ctx.add_variable("l", (0..2_000i64).collect::<Vec<_>>())
+                    .unwrap();
+                let started = std::time::Instant::now();
+                let result = run(&ctx, "l.all(x, 'a'.matches(p) || true)");
+                let elapsed = started.elapsed();
+                let head: std::string::String = pattern.chars().take(24).collect();
+                assert!(
+                    result == steps_exceeded(10_000),
+                    "{head} (max_regex_len {max_regex_len}): {result:?}"
+                );
+                assert!(
+                    elapsed < Duration::from_millis(200),
+                    "{head} (max_regex_len {max_regex_len}) took {elapsed:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "regex")]

@@ -39,6 +39,8 @@ pub use parser::{ParseError, ParseErrors};
 pub mod functions;
 mod magic;
 pub mod objects;
+#[cfg(feature = "regex")]
+mod regex_cost;
 mod resolvers;
 pub mod runtime;
 pub use runtime::{BudgetKind, Deadline, EvalUsage, Interrupt, RuntimeOptions};
