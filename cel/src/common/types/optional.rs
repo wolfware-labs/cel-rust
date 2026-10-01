@@ -19,11 +19,9 @@ impl<'v> OptionalInternal<'v> {
     where
         'v: 'w,
     {
-        // An `Arc<dyn Val + 'v>` cannot be shortened to `'w`, so both variants
-        // are cloned into a `Box`.
         match self {
             OptionalInternal::Box(val) => OptionalInternal::Box(val.clone_as_boxed()),
-            OptionalInternal::Arc(val) => OptionalInternal::Box(val.clone_as_boxed()),
+            OptionalInternal::Arc(val) => OptionalInternal::Arc(Arc::clone(val)),
         }
     }
 
@@ -458,12 +456,17 @@ mod tests {
 
     #[test]
     fn clone_keeps_arc_backed_optional() {
-        let some = Optional::from(Some(Arc::new(CelInt::from(1)) as Arc<dyn Val>));
+        let shared: Arc<dyn Val> = Arc::new(CelInt::from(1));
+        let some = Optional::from(Some(Arc::clone(&shared)));
         let cloned = some.clone_as_boxed();
         let cloned = cloned
             .downcast_ref::<Optional>()
             .expect("still an optional");
-        assert!(cloned.option().is_some());
+        let Some(OptionalInternal::Arc(inner)) = &cloned.0 else {
+            panic!("clone should stay Arc-backed");
+        };
+        assert!(Arc::ptr_eq(inner, &shared));
+        assert_eq!(inner.downcast_ref::<CelInt>().unwrap(), &CelInt::from(1));
     }
 
     #[test]
@@ -481,10 +484,9 @@ mod tests {
 
     fn is_true(expr: &str) -> bool {
         eval(expr, |v| {
-            v.downcast_ref::<CelBool>()
+            *v.downcast_ref::<CelBool>()
                 .unwrap_or_else(|| panic!("`{expr}` did not evaluate to a bool"))
                 .inner()
-                .to_owned()
         })
     }
 
