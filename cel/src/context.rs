@@ -196,11 +196,15 @@ impl<'p, 'v> Context<'p, 'v> {
     }
 
     /// Sets the [`RuntimeOptions`] (budgets and interrupt poll frequency) of
-    /// the evaluations performed with this context or a scope derived from it,
-    /// replacing those of the [`Env`] for them.
+    /// the evaluations performed with this context or a scope derived from it.
     ///
-    /// The nearest scope's options apply, else the `Env`'s: one `Env` can be
-    /// shared by contexts that each bound their evaluations differently.
+    /// The options are laid over those of the parent scopes and of the
+    /// [`Env`]: every field left unset (zero, the default) is inherited, so a
+    /// context can add a steps budget and keep the `Env`'s iteration budget.
+    /// An inherited budget cannot be lifted by setting zero; set a larger
+    /// limit instead. [`budget`](Self::budget) returns the options in force.
+    /// One `Env` can thus be shared by contexts that each bound their
+    /// evaluations differently.
     ///
     /// # Example
     /// ```
@@ -228,13 +232,33 @@ impl<'p, 'v> Context<'p, 'v> {
         }
     }
 
-    /// The options in force for an evaluation under this context: the nearest
-    /// scope's, else the [`Env`]'s.
-    pub(crate) fn budget(&self) -> &RuntimeOptions {
+    /// The [`RuntimeOptions`] in force for an evaluation started with this
+    /// context: those set with [`set_budget`](Self::set_budget) on this
+    /// scope, laid over those of its parent scopes, laid over the [`Env`]'s.
+    /// A field a scope leaves unset (zero) is inherited.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{Context, Env, RuntimeOptions};
+    /// use std::sync::Arc;
+    ///
+    /// let mut env = Env::stdlib();
+    /// env.set_options(RuntimeOptions::default().with_max_iterations(1_000));
+    /// let mut ctx = Context::with_env(Arc::new(env));
+    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(10_000));
+    ///
+    /// let budget = ctx.budget();
+    /// assert_eq!(budget.max_steps(), 10_000);
+    /// assert_eq!(budget.max_iterations(), 1_000);
+    /// ```
+    pub fn budget(&self) -> RuntimeOptions {
         match self {
-            Context::Root { budget, env, .. } => budget.as_ref().unwrap_or(env.options()),
+            Context::Root { budget, env, .. } => match budget {
+                Some(budget) => budget.over(env.options()),
+                None => env.options().clone(),
+            },
             Context::Child { budget, parent, .. } => match budget {
-                Some(budget) => budget,
+                Some(budget) => budget.over(&parent.budget()),
                 None => parent.budget(),
             },
         }
@@ -270,13 +294,13 @@ impl<'p, 'v> Context<'p, 'v> {
         if interrupt.is_none() && options.is_unbounded() {
             return None;
         }
-        Some(Frame::new(options, interrupt))
+        Some(Frame::new(&options, interrupt))
     }
 
     /// Creates a [`Frame`] for a new evaluation under this context even when
     /// there is nothing to enforce, to count the resources it uses.
     pub(crate) fn new_counting_frame(&self) -> Frame<'v> {
-        Frame::new(self.budget(), self.interrupt())
+        Frame::new(&self.budget(), self.interrupt())
     }
 
     /// Creates an inner scope evaluating within `frame`, which the caller owns

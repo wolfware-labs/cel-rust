@@ -149,7 +149,8 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         RuntimeOptions {
             max_iterations: 0,
-            interrupt_check_frequency: 1,
+            // zero: not set, which reads as polling on every iteration
+            interrupt_check_frequency: 0,
             max_steps: 0,
             max_bytes: 0,
             max_regex_len: 0,
@@ -183,7 +184,7 @@ impl RuntimeOptions {
 
     /// How many comprehension iterations run between polls of the interrupt handle.
     pub fn interrupt_check_frequency(&self) -> u64 {
-        self.interrupt_check_frequency
+        self.interrupt_check_frequency.max(1)
     }
 
     /// Caps the number of evaluation steps a single evaluation may take.
@@ -275,6 +276,22 @@ impl RuntimeOptions {
     /// The regex pattern length limit, zero meaning unlimited.
     pub fn max_regex_len(&self) -> u64 {
         self.max_regex_len
+    }
+
+    /// These options laid over `base`: every field these options leave unset
+    /// (zero, the default) takes the value it has in `base`.
+    pub(crate) fn over(&self, base: &RuntimeOptions) -> RuntimeOptions {
+        let pick = |own: u64, inherited: u64| if own == 0 { inherited } else { own };
+        RuntimeOptions {
+            max_iterations: pick(self.max_iterations, base.max_iterations),
+            interrupt_check_frequency: pick(
+                self.interrupt_check_frequency,
+                base.interrupt_check_frequency,
+            ),
+            max_steps: pick(self.max_steps, base.max_steps),
+            max_bytes: pick(self.max_bytes, base.max_bytes),
+            max_regex_len: pick(self.max_regex_len, base.max_regex_len),
+        }
     }
 
     /// Whether these options set no budget of any kind.
@@ -1235,8 +1252,42 @@ mod tests {
         let mut ctx = steps_budget(2);
         ctx.set_budget(RuntimeOptions::default().with_max_steps(3));
         assert_eq!(run(&ctx, "1 + 1"), Ok(2.into()));
+        // an override leaving the steps unset inherits the env's
         ctx.set_budget(RuntimeOptions::default());
-        assert_eq!(run(&ctx, "1 + 1 + 1 + 1"), Ok(4.into()));
+        assert_eq!(run(&ctx, "1 + 1"), steps_exceeded(2));
+    }
+
+    #[test]
+    fn context_budget_inherits_unset_fields() {
+        // the Env caps iterations and polls every 10th iteration...
+        let mut env = Env::stdlib();
+        env.set_options(
+            RuntimeOptions::default()
+                .with_max_iterations(5)
+                .with_interrupt_check_frequency(10),
+        );
+        let mut ctx = Context::with_env(Arc::new(env));
+        // ...a context adding a steps budget keeps both
+        ctx.set_budget(RuntimeOptions::default().with_max_steps(1_000));
+        let effective = ctx.budget();
+        assert_eq!(effective.max_steps(), 1_000);
+        assert_eq!(effective.max_iterations(), 5);
+        assert_eq!(effective.interrupt_check_frequency(), 10);
+        assert_eq!(
+            run(&ctx, "[1, 2, 3, 4, 5, 6].all(x, x > 0)"),
+            budget_exceeded(5)
+        );
+        // a child scope overrides only what it sets
+        let mut child = ctx.new_inner_scope();
+        child.set_budget(RuntimeOptions::default().with_max_iterations(10));
+        let effective = child.budget();
+        assert_eq!(effective.max_iterations(), 10);
+        assert_eq!(effective.max_steps(), 1_000);
+        assert_eq!(effective.interrupt_check_frequency(), 10);
+        assert_eq!(
+            run(&child, "[1, 2, 3, 4, 5, 6].all(x, x > 0)"),
+            Ok(true.into())
+        );
     }
 
     #[test]
