@@ -88,5 +88,22 @@ let program = Program::compile("[1, 2, 3].all(x, x > 0)").unwrap();
 assert_eq!(program.execute(&context), Ok(true.into()));
 ```
 
+Steps (`with_max_steps`: nodes evaluated and functions called) and bytes (`with_max_bytes`: bytes
+allocated for the values created) budgets bound the rest of what an expression does, and fail with
+`ExecutionError::BudgetExceeded { kind, limit }`. `Context::set_budget` overrides the `Env`'s options for
+one context, and `Program::execute_with_usage` reports what an evaluation used. Budget errors are never
+absorbed by `||`, `&&`, comprehension macros or optional accessors.
+
+```rust
+use cel::{Context, Program, RuntimeOptions};
+
+let mut context = Context::default();
+context.set_budget(RuntimeOptions::default().with_max_steps(1_000).with_max_bytes(64 * 1024));
+let program = Program::compile("[1, 2, 3].all(x, x > 0)").unwrap();
+let (result, usage) = program.execute_with_usage(&context);
+assert_eq!(result, Ok(true.into()));
+assert_eq!(usage.iterations, 3);
+```
+
 Custom functions can poll the handle through `FunctionContext::is_interrupted()` to return early from
 long-running work.
