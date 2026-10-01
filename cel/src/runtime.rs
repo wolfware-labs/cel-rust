@@ -1228,6 +1228,55 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn steps_budget_charges_refolding_negated_brackets() {
+        // A nested `[^..]` is folded, then negated: nearly all of Unicode,
+        // still marked folded. A literal beside it makes its parent fold it
+        // again, ~10 ms. Each takes over 1 ms in release: a single call
+        // must not fit in 10,000 steps.
+        let mut failed = vec![];
+        for pattern in [
+            r"(?i)[a[^\x{0}]]".to_owned(),
+            r"(?i)[a[^\p{Han}]]".to_owned(),
+            format!("(?i){}[[:^alpha:]]{}", "[a".repeat(10), "]".repeat(10)),
+            format!("(?i)[a{}]", "[^a]".repeat(10)),
+            format!("(?i){}[^a]{}", "[a".repeat(100), "]".repeat(100)),
+            r"(?i)[a[:^alpha:]]".to_owned(),
+        ] {
+            let limit = 10_000;
+            let mut ctx = with_options(
+                RuntimeOptions::default()
+                    .with_max_steps(limit)
+                    .with_regex_size_limit(1 << 20),
+            );
+            ctx.add_variable("p", pattern.clone()).unwrap();
+            let result = run(&ctx, "'a'.matches(p)");
+            if result != steps_exceeded(limit) {
+                let shown: std::string::String = format!("{result:?}").chars().take(80).collect();
+                failed.push(format!("{pattern}: {shown}"));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+        // under bb-cel's settings, the first call already exhausts the budget
+        let mut ctx = with_options(
+            RuntimeOptions::default()
+                .with_max_steps(10_000)
+                .with_max_bytes(1 << 20)
+                .with_regex_size_limit(1 << 20)
+                .with_max_regex_len(512),
+        );
+        let pattern = format!("(?i){}[^\\x{{0}}]{}", "[a".repeat(10), "]".repeat(10));
+        ctx.add_variable("p", pattern).unwrap();
+        ctx.add_variable("l", (0..2_000i64).collect::<Vec<_>>())
+            .unwrap();
+        let (result, usage) = Program::compile("l.all(x, 'a'.matches(p) || true)")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, steps_exceeded(10_000));
+        assert!(usage.iterations <= 1, "{usage:?}");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn regex_size_limit_fails_big_compiles() {
         let ctx = with_options(RuntimeOptions::default().with_regex_size_limit(16 * 1024));
         let started = std::time::Instant::now();

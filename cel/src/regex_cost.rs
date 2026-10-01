@@ -6,7 +6,10 @@
 //! of a set operation (`&&`, `--`, `~~`) not known to be folded already:
 //! one that holds a range, a literal or a Perl class. Folding a bracket
 //! folds all it holds, nested brackets included, so `(?i)[a[a[\w]]]` folds
-//! `\w` three times.
+//! `\w` three times. A nested bracket or ASCII class is folded before it is
+//! negated, so negated (`[^a]`, `[:^alpha:]`) it holds nearly every
+//! codepoint when its parent folds it again: `(?i)[a[^a]]` folds all of
+//! Unicode, ~10 ms.
 //! That work is not reflected in the size of the compiled automaton
 //! (`(?i)[\p{Greek}...]` repeated thousands of times compiles small), so it
 //! is priced from the parsed pattern, before the compile runs.
@@ -51,6 +54,10 @@ const FOLDED_LITERAL: u64 = 50;
 /// property is unavailable, every codepoint, which only overcharges.
 static CASED: LazyLock<Vec<(u32, u32)>> =
     LazyLock::new(|| unicode_ranges(r"\p{CWCM}").unwrap_or_else(|| vec![(0, char::MAX as u32)]));
+
+/// The steps of case folding every codepoint, ~166,000: a bound on folding
+/// any class, used for the complement of a negated bracket.
+static EVERYTHING: LazyLock<u64> = LazyLock::new(|| fold_range(0, char::MAX as u32));
 
 /// The ranges of the Unicode class `item` (e.g. `\p{Greek}`), translated on
 /// its own, without case folding.
@@ -116,9 +123,12 @@ enum Event<'p> {
     Open,
     /// An item is unioned into the open class.
     Item(Item<'p>),
-    /// A bracket nested in another closes: it is folded (unless known to be
-    /// folded already) and unioned into its parent.
-    CloseNested,
+    /// A bracket nested in another closes, and whether it is negated: it is
+    /// folded (unless known to be folded already), negated, and unioned into
+    /// its parent. Negated, it holds nearly every codepoint, and stays known
+    /// to be folded only until a sibling clears the mark: then its parent
+    /// folds all of it again.
+    CloseNested(bool),
     /// An outermost bracket closes: it is folded, unless known to be.
     Close,
     /// A set operation: its two operands, the last two classes opened, are
@@ -138,6 +148,11 @@ enum Item<'p> {
     Perl(&'p str),
     /// A range of codepoints, or a single one.
     Range(u32, u32),
+    /// An ASCII class (`[:alpha:]`), and whether it is negated
+    /// (`[:^alpha:]`). Like a Unicode class it is folded, then negated, as
+    /// it is translated, and then known to be folded; negated, it holds
+    /// nearly every codepoint.
+    Ascii(bool),
 }
 
 /// What the translation of a pattern does, as collected from its syntax.
@@ -257,8 +272,7 @@ impl<'p> ast::Visitor for Collect<'p> {
                 let (lo, hi) = (range.start.c as u32, range.end.c as u32);
                 Item::Range(lo.min(hi), lo.max(hi))
             }
-            // `[:alpha:]` and the like: ASCII at most
-            ClassSetItem::Ascii(_) => Item::Range(0, 0x7F),
+            ClassSetItem::Ascii(class) => Item::Ascii(class.negated),
             ClassSetItem::Empty(_) | ClassSetItem::Union(_) => return Ok(()),
         };
         self.items.events.push(Event::Item(item));
@@ -266,8 +280,8 @@ impl<'p> ast::Visitor for Collect<'p> {
     }
 
     fn visit_class_set_item_post(&mut self, item: &ClassSetItem) -> Result<(), ()> {
-        if let ClassSetItem::Bracketed(_) = item {
-            self.items.events.push(Event::CloseNested);
+        if let ClassSetItem::Bracketed(bracket) = item {
+            self.items.events.push(Event::CloseNested(bracket.negated));
         }
         Ok(())
     }
@@ -401,6 +415,14 @@ pub(crate) fn translation_steps(pattern: &str, cap: u64) -> u64 {
                         };
                         (0, built)
                     }
+                    Item::Ascii(negated) => {
+                        let ascii = fold_range(0, 0x7F);
+                        let built = Building {
+                            fold: if negated { *EVERYTHING } else { ascii },
+                            folded: true,
+                        };
+                        (ascii, built)
+                    }
                     Item::Range(lo, hi) => {
                         let built = Building {
                             fold: fold_range(lo, hi),
@@ -414,9 +436,14 @@ pub(crate) fn translation_steps(pattern: &str, cap: u64) -> u64 {
                 }
                 steps
             }
-            Event::CloseNested => {
+            Event::CloseNested(negated) => {
                 let mut nested = open.pop().unwrap_or(Building::EMPTY);
                 let steps = nested.fold();
+                if negated {
+                    // folded again, it is its complement that is folded:
+                    // bounded by folding every codepoint
+                    nested.fold = *EVERYTHING;
+                }
                 if let Some(class) = open.last_mut() {
                     class.union(nested);
                 }
@@ -516,6 +543,23 @@ mod tests {
         let lu = translation_steps(r"(?i)\p{Lu}", u64::MAX);
         let lu2 = translation_steps(r"(?i)[\p{Lu}\p{Lu}]", u64::MAX);
         assert!(lu2 < 2 * lu + 500, "{lu} {lu2}");
+    }
+
+    #[test]
+    fn negated_brackets_fold_their_complement_again() {
+        // folded, then negated: still known folded, so free on its own
+        assert!(translation_steps(r"(?i)[[^\x{0}]]", u64::MAX) < 1_000);
+        assert!(translation_steps(r"(?i)[^a]", u64::MAX) < 1_000);
+        // a literal beside it makes the parent fold nearly all of Unicode
+        assert!(translation_steps(r"(?i)[a[^\x{0}]]", u64::MAX) > 100_000);
+        assert!(translation_steps(r"(?i)[a[^\p{Han}]]", u64::MAX) > 100_000);
+        // as many times as it is folded again
+        let ten = translation_steps(&format!("(?i)[a{}]", "[^a]".repeat(10)), u64::MAX);
+        assert!(ten > 1_000_000, "{ten}");
+        // so does a negated ASCII class
+        assert!(translation_steps(r"(?i)[[:^alpha:]]", u64::MAX) < 1_000);
+        assert!(translation_steps(r"(?i)[a[:^alpha:]]", u64::MAX) > 100_000);
+        assert!(translation_steps(r"(?i)[a[:alpha:]]", u64::MAX) < 1_000);
     }
 
     #[test]
