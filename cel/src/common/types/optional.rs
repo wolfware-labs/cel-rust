@@ -15,13 +15,13 @@ enum OptionalInternal<'v> {
 }
 
 impl<'v> OptionalInternal<'v> {
-    fn clone_as_boxed<'w>(&self) -> Box<dyn Val + 'w>
+    fn clone_as_boxed<'w>(&self) -> OptionalInternal<'w>
     where
         'v: 'w,
     {
         match self {
-            OptionalInternal::Box(val) => val.clone_as_boxed(),
-            OptionalInternal::Arc(val) => val.clone_as_boxed(),
+            OptionalInternal::Box(val) => OptionalInternal::Box(val.clone_as_boxed()),
+            OptionalInternal::Arc(val) => OptionalInternal::Arc(Arc::clone(val)),
         }
     }
 
@@ -59,7 +59,7 @@ impl<'v> Val for Optional<'v> {
     {
         match &self.0 {
             None => Box::new(Optional(None)),
-            Some(val) => val.clone_as_boxed(),
+            Some(val) => Box::new(Optional(Some(val.clone_as_boxed()))),
         }
     }
 
@@ -420,5 +420,89 @@ mod tests {
         let a = Optional::of(Box::new(CelInt::from(1)));
         let b = CelInt::from(1);
         assert!(!a.equals(&b));
+    }
+
+    fn eval<R>(expr: &str, f: impl FnOnce(&dyn Val) -> R) -> R {
+        use crate::parser::Parser;
+        let ast = Parser::default()
+            .enable_optional_syntax(true)
+            .parse(expr)
+            .unwrap();
+        let mut ctx = crate::Context::default();
+        ctx.add_variable_from_value(
+            "o",
+            crate::Value::Opaque(Arc::new(crate::objects::OptionalValue::of(1.into()))),
+        );
+        ctx.add_variable_from_value(
+            "n",
+            crate::Value::Opaque(Arc::new(crate::objects::OptionalValue::none())),
+        );
+        let v = crate::Value::resolve_val(&ast, &ctx).unwrap();
+        f(&*v)
+    }
+
+    #[test]
+    fn clone_keeps_some_optional() {
+        let some = Optional::of(Box::new(CelInt::from(1)));
+        let cloned = some.clone_as_boxed();
+        let cloned = cloned
+            .downcast_ref::<Optional>()
+            .expect("still an optional");
+        assert_eq!(
+            cloned.option().unwrap().downcast_ref::<CelInt>().unwrap(),
+            &CelInt::from(1)
+        );
+    }
+
+    #[test]
+    fn clone_keeps_arc_backed_optional() {
+        let shared: Arc<dyn Val> = Arc::new(CelInt::from(1));
+        let some = Optional::from(Some(Arc::clone(&shared)));
+        let cloned = some.clone_as_boxed();
+        let cloned = cloned
+            .downcast_ref::<Optional>()
+            .expect("still an optional");
+        let Some(OptionalInternal::Arc(inner)) = &cloned.0 else {
+            panic!("clone should stay Arc-backed");
+        };
+        assert!(Arc::ptr_eq(inner, &shared));
+        assert_eq!(inner.downcast_ref::<CelInt>().unwrap(), &CelInt::from(1));
+    }
+
+    #[test]
+    fn clone_keeps_none() {
+        let cloned = Optional::none().clone_as_boxed();
+        let cloned = cloned
+            .downcast_ref::<Optional>()
+            .expect("still an optional");
+        assert!(cloned.option().is_none());
+    }
+
+    fn is_optional(expr: &str) -> bool {
+        eval(expr, |v| v.downcast_ref::<Optional>().is_some())
+    }
+
+    fn is_true(expr: &str) -> bool {
+        eval(expr, |v| {
+            *v.downcast_ref::<CelBool>()
+                .unwrap_or_else(|| panic!("`{expr}` did not evaluate to a bool"))
+                .inner()
+        })
+    }
+
+    #[test]
+    fn list_element_stays_optional() {
+        assert!(is_optional("[o][0]"));
+        assert!(is_optional("[n][0]"));
+        assert!(is_true("[o][0].hasValue()"));
+        assert!(!is_true("[n][0].hasValue()"));
+    }
+
+    #[test]
+    fn map_over_optionals_stays_optional() {
+        assert!(is_optional("[1].map(x, o)[0]"));
+        assert!(is_optional("[1].map(x, n)[0]"));
+        assert!(is_true("[1].map(x, o)[0].hasValue()"));
+        assert!(!is_true("[1].map(x, n)[0].hasValue()"));
     }
 }
