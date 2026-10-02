@@ -5,6 +5,7 @@ use crate::common::{
     value::CowVal,
 };
 use crate::registry::{TypeDecl, TypeRegistry};
+use crate::runtime::RuntimeOptions;
 use crate::DeclarationError;
 #[cfg(feature = "structs")]
 use crate::{common::types::CelStruct, common::value::Val, ExecutionError, StructType};
@@ -56,6 +57,7 @@ pub struct Env {
     functions: BTreeMap<String, FunctionDecl>,
     namespaces: BTreeSet<String>,
     types: TypeRegistry,
+    options: RuntimeOptions,
     error_on_duplicate_map_keys: bool,
 }
 
@@ -65,6 +67,7 @@ impl Default for Env {
             functions: BTreeMap::new(),
             namespaces: BTreeSet::new(),
             types: TypeRegistry::default(),
+            options: RuntimeOptions::default(),
             error_on_duplicate_map_keys: true,
         }
     }
@@ -241,6 +244,25 @@ impl Env {
     /// and so is registering a struct type whose type was registered alone.
     pub fn add_type(&mut self, t: impl Into<TypeDecl>) -> Result<(), DeclarationError> {
         self.types.register(t)
+    }
+
+    /// The runtime policy applied to every evaluation under this environment.
+    pub fn options(&self) -> &RuntimeOptions {
+        &self.options
+    }
+
+    /// Replaces the runtime policy applied to every evaluation under this environment.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{Env, RuntimeOptions};
+    ///
+    /// let mut env = Env::stdlib();
+    /// env.set_options(RuntimeOptions::default().with_max_iterations(10_000));
+    /// assert_eq!(env.options().max_iterations(), 10_000);
+    /// ```
+    pub fn set_options(&mut self, options: RuntimeOptions) {
+        self.options = options;
     }
 
     /// The types registered with the environment.
