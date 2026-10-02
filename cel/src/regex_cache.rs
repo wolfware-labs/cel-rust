@@ -60,20 +60,32 @@ pub(crate) fn size_limit(regex_size_limit: u64) -> usize {
 /// [`max_bytes`](Self::with_max_bytes), plus the pinned ones (see
 /// [`RegexCache::prewarm`]), which count against neither.
 ///
-/// Each kept regex also keeps the scratch space of its matches: a pool of
-/// caches, one for each thread that matched it at the same time as
-/// another, which stay with the regex. A cache holds a lazy DFA of up to
-/// 2 MiB, or the size limit when smaller, and the state of the other
-/// engines, about the size of the automaton; about 0.6 MiB per pattern and
-/// thread was measured for patterns near 1 MiB. This memory is not counted
-/// by `max_bytes`. Matches under a budget run automata of their own (see
-/// `regex_scan`), counted with the pattern's, with a second such pool of
-/// caches, each holding a lazy DFA of the same capacity: up to twice the
-/// scratch space for a pattern matched both with and without a budget.
-/// With `T` threads matching, the cache can so hold up to
+/// A compiled pattern's automata are the `meta` regex `matches` runs
+/// without a budget, and those it runs under one: an NFA without captures,
+/// a lazy DFA and a PikeVM over it, about a third of the size of the
+/// `meta` regex. Both count against `max_bytes`, and both are in
+/// [`RegexCache::pinned_bytes`].
 ///
-/// `max_bytes + capacity × T × 2 × (2 MiB + automaton)`, plus the pinned
-/// patterns.
+/// Each kept regex also keeps the scratch space of its matches, which
+/// `max_bytes` does not count: for each thread that matched it at the same
+/// time as another, a cache that stays with the regex.
+///
+/// - Without a budget, a cache holds the `meta` regex's lazy DFA, of up to
+///   2 MiB or the size limit when smaller, and the state of its other
+///   engines, about the size of the automaton: about 0.6 MiB per pattern
+///   and thread was measured for patterns near 1 MiB.
+/// - Under a budget, a cache holds the lazy DFA of the budgeted automata,
+///   of up to [`budget_dfa_bytes`](Self::with_budget_dfa_bytes) (256 KiB by
+///   default) beyond the least the automaton needs (~20 KB for a small
+///   pattern, ~430 KB for one near 1 MiB), and the PikeVM's state, about
+///   the size of its NFA. 32 patterns whose subjects fill it, matched on
+///   16 threads, were measured at ~0.2 MiB per pattern and thread.
+///
+/// With `T` threads matching both with and without a budget, the cache can
+/// so hold up to
+///
+/// `max_bytes + capacity × T × (2 MiB + automaton + budget_dfa_bytes +
+/// least + NFA)`, plus the pinned patterns and their scratch space.
 ///
 /// Without an evaluation budget, patterns compile under the `regex` crate's
 /// default limits, so an automaton is up to 10 MiB: with the defaults, at
@@ -268,7 +280,8 @@ struct Slot {
     /// Kept by [`RegexCache::prewarm`]: never evicted.
     pinned: bool,
     /// What the entry counts against [`RegexCacheOptions::with_max_bytes`]:
-    /// the size of the automaton, or of the error message.
+    /// the size of the automata, the budgeted NFA included, or of the error
+    /// message.
     bytes: u64,
     /// The tick the entry was inserted at, unique.
     inserted: u64,
@@ -306,8 +319,8 @@ pub(crate) struct Compiled {
 }
 
 impl Compiled {
-    /// The bytes the entry holds: the size of the automaton, or of the
-    /// error message.
+    /// The bytes the entry holds: the size of the `meta` regex plus the
+    /// budgeted NFA (see [`Scanner::bytes`]), or of the error message.
     fn bytes(&self) -> u64 {
         match &self.regex {
             Ok(_) => self.built.saturating_add(self.scanner_bytes()),
@@ -413,14 +426,19 @@ impl RegexCache {
     }
 
     /// The bytes the pinned patterns hold (see [`prewarm`](Self::prewarm)):
-    /// the sum of the sizes of their compiled automata, a pattern pinned as
-    /// its error counting the length of the error message.
+    /// the sum of the sizes of their compiled automata, those `matches`
+    /// runs without a budget and the NFA it runs under one (see
+    /// [Memory](RegexCacheOptions#memory)), a pattern pinned as its error
+    /// counting the length of the error message.
     ///
     /// Pins count against neither the capacity nor the
     /// [bytes](RegexCacheOptions::with_max_bytes) of the cache: bound them
-    /// with this. Each automaton is at most the size limit it was compiled
-    /// under, plus a lazy DFA cache per thread that matches it, of up to
-    /// that limit (2 MiB at most), which this does not count.
+    /// with this. Each `meta` automaton is at most the size limit it was
+    /// compiled under. This does not count the scratch space of the threads
+    /// matching them, see [Memory](RegexCacheOptions#memory): per pattern
+    /// and thread, up to 2 MiB without a budget, and up to
+    /// [`budget_dfa_bytes`](RegexCacheOptions::with_budget_dfa_bytes) plus
+    /// the least the automaton needs under one.
     pub fn pinned_bytes(&self) -> usize {
         usize::try_from(self.state().pinned_bytes).unwrap_or(usize::MAX)
     }
