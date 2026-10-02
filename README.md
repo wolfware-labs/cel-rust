@@ -114,5 +114,6 @@ under it. Under a steps budget, only the call that compiles a pattern pays for p
 later calls pay the lookup and the match, and a pattern is kept only once its compile was paid for. Other
 evaluations can evict a kept pattern, so size budgets for compiling every pattern, unless the patterns are
 pinned with `RegexCache::prewarm`. The cache keeps at most 64 MiB of automata by default
-(`RegexCacheOptions::with_max_bytes`), plus the pinned ones, plus each kept regex's matching scratch space:
+(`RegexCacheOptions::with_max_bytes`), plus the pinned ones (`RegexCache::pinned_bytes`), plus each kept
+regex's matching scratch space:
 up to ~2 MiB per pattern for each thread matching it, so up to 64 × threads × ~2 MiB with the defaults.
