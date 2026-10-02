@@ -507,7 +507,8 @@ impl<'a> Frame<'a> {
     ///   brackets included);
     /// - on a miss only, compiling: one step per 8 bytes of the compiled
     ///   automaton, or of the size limit when the compile fails for size,
-    ///   as the work up to the limit was done anyway;
+    ///   as the work up to the limit was done anyway. The compiled pattern
+    ///   is kept in `cache` only once this charge succeeds;
     /// - matching: two steps per KiB of automaton per 64 bytes of subject
     ///   (rounded up), charged before matching, as a match can cost up to
     ///   the automaton's states times the subject.
@@ -568,19 +569,15 @@ impl<'a> Frame<'a> {
         )) {
             return Err(self.exceeded());
         }
-        // kept even if the charge below stops the evaluation: the work is
-        // done, and a later call reuses it, charged the lookup and the match
-        let compiled = cache.insert(
-            pattern,
-            size_limit,
-            crate::regex_cache::compile(pattern, size_limit),
-        );
+        let compiled = crate::regex_cache::compile(pattern, size_limit);
         let steps = match compiled.built() {
             0 => pattern.len() as u64 / 64 + 1,
             built => built / 8,
         };
+        // kept only once paid for: a compile the budget refuses is dropped,
+        // so evaluations that are refused cannot fill the cache
         match self.add_steps(steps) {
-            true => Ok(compiled),
+            true => Ok(cache.insert(pattern, size_limit, compiled)),
             false => Err(self.exceeded()),
         }
     }

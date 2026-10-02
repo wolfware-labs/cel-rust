@@ -323,3 +323,30 @@ fn env_is_send_and_sync() {
     assert_send_sync::<Env>();
     assert_send_sync::<cel::RegexCache>();
 }
+
+/// Under a budget, the cache keeps only what an evaluation paid for: a
+/// compile whose charge stops the evaluation is dropped.
+#[test]
+fn a_compile_the_budget_refuses_is_not_kept() {
+    let env = Arc::new(Env::stdlib());
+    let mut ctx = Context::with_env(env.clone());
+    ctx.add_variable_from_value("path", PATH);
+    ctx.set_budget(gateway_budget());
+    for pattern in [r"(?:\w{17}|z1)y", r"\w{1000}"] {
+        ctx.add_variable_from_value("p", pattern);
+        let (result, _) = run(&ctx, "'a'.matches(p) || true");
+        assert_eq!(
+            result,
+            Err(ExecutionError::BudgetExceeded {
+                kind: BudgetKind::Steps,
+                limit: 10_000
+            }),
+            "{pattern}"
+        );
+    }
+    assert_eq!(env.regex_cache().len(), 0);
+    // what it can pay for is kept
+    ctx.add_variable_from_value("p", PATH_PATTERN);
+    assert_eq!(run(&ctx, "path.matches(p)").0, Ok(true.into()));
+    assert_eq!(env.regex_cache().len(), 1);
+}
