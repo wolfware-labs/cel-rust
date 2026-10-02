@@ -514,7 +514,10 @@ impl<'a> Frame<'a> {
     ///   is kept in `cache` only once this charge succeeds;
     /// - matching: two steps per KiB of automaton per 64 bytes of subject
     ///   (rounded up), charged before matching, as a match can cost up to
-    ///   the automaton's states times the subject.
+    ///   the automaton's states times the subject; and, when the pattern
+    ///   has Unicode word boundaries the lazy DFA cannot scan a non-ASCII
+    ///   subject with, at least the slower engine's per-byte cost, see
+    ///   `Compiled::scan_steps`.
     ///
     /// A pattern compiled by an earlier call, or an earlier evaluation, is
     /// so charged the lookup and the match only.
@@ -541,11 +544,7 @@ impl<'a> Frame<'a> {
             None => self.compile(cache, pattern, size_limit)?,
         };
         let regex = compiled.regex()?;
-        let size = compiled.built();
-        let scan = (size / 1024 + 1)
-            .saturating_mul(subject.len() as u64 / 64 + 1)
-            .saturating_mul(2);
-        if !self.add_steps(scan) {
+        if !self.add_steps(compiled.scan_steps(subject)) {
             return Err(self.exceeded());
         }
         Ok(regex.is_match(subject))
@@ -1290,6 +1289,51 @@ mod tests {
             .execute_with_usage(&ctx);
         assert_eq!(result, steps_exceeded(10_000));
         assert!(usage.iterations <= 1, "{usage:?}");
+    }
+
+    /// A string of `len` bytes mixing ASCII letters and digits with
+    /// non-ASCII letters, as a request path can be.
+    #[cfg(feature = "regex")]
+    fn mixed_unicode(len: usize) -> std::string::String {
+        let alphabet: Vec<char> = "abcXYZ019éßπжあ".chars().collect();
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = std::string::String::from("/");
+        loop {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let c = alphabet[(state >> 33) as usize % alphabet.len()];
+            if out.len() + c.len_utf8() > len {
+                return out;
+            }
+            out.push(c);
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_unicode_word_boundary_scans() {
+        // Unicode `\b` makes the lazy DFA quit on a non-ASCII byte, and a
+        // slower engine scans the subject: ~400 ns a byte for this small
+        // automaton, 3.3 ms over 8 KiB, ~40,000 steps
+        let pattern = r"(?:\b\B|\B\b|\b\b\B|\B\B\b)";
+        let limit = 20_000;
+        let mut ctx = with_options(
+            RuntimeOptions::default()
+                .with_max_steps(limit)
+                .with_regex_size_limit(1 << 20),
+        );
+        ctx.add_variable("p", pattern).unwrap();
+        ctx.add_variable("s", mixed_unicode(8 << 10)).unwrap();
+        let ascii = "abc XYZ 019 ".repeat(700);
+        ctx.add_variable("a", ascii.as_str()).unwrap();
+        assert_eq!(run(&ctx, "s.matches(p)"), steps_exceeded(limit));
+        // the lazy DFA runs an ASCII subject: charged by the automaton
+        let (result, usage) = Program::compile("a.matches(p)")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, Ok(false.into()));
+        assert!(usage.steps < 5_000, "{usage:?}");
     }
 
     #[cfg(feature = "regex")]
