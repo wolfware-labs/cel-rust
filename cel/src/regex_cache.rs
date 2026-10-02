@@ -49,20 +49,47 @@ pub(crate) fn size_limit(regex_size_limit: u64) -> usize {
 ///
 /// The cache changes no result: a pattern is compiled exactly as without
 /// it. Under an evaluation budget, a pattern found in the cache is charged
-/// the lookup and the match, but not its parsing and compiling again.
+/// the lookup and the match, but not its parsing and compiling again, and a
+/// pattern is kept only once an evaluation has paid for compiling it.
+///
+/// # Memory
+///
+/// The cache holds the compiled automata of up to
+/// [`capacity`](Self::with_capacity) patterns, in all at most
+/// [`max_bytes`](Self::with_max_bytes), plus the pinned ones (see
+/// [`RegexCache::prewarm`]), which count against neither.
+///
+/// Each kept regex also keeps the scratch space of its matches: a pool of
+/// caches, one for each thread that matched it at the same time as
+/// another, which stay with the regex. A cache holds a lazy DFA of up to
+/// 2 MiB, or the size limit when smaller, and the state of the other
+/// engines, about the size of the automaton; about 0.6 MiB per pattern and
+/// thread was measured for patterns near 1 MiB. This memory is not counted
+/// by `max_bytes`. With `T` threads matching, the cache can so hold up to
+///
+/// `max_bytes + capacity × T × (2 MiB + automaton)`, plus the pinned patterns.
+///
+/// Without an evaluation budget, patterns compile under the `regex` crate's
+/// default limits, so an automaton is up to 10 MiB: with the defaults, at
+/// most 64 MiB of automata, plus 64 × `T` × ~2 MiB of scratch space. Under
+/// a budget, a pattern is kept only once its compile was paid for, which a
+/// 10k-step budget allows up to ~80 KB of automaton.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RegexCacheOptions {
     capacity: usize,
     max_pattern_len: usize,
+    max_bytes: u64,
 }
 
 impl Default for RegexCacheOptions {
-    /// 64 patterns, of up to 4,096 bytes each.
+    /// 64 patterns, of up to 4,096 bytes each, with up to 64 MiB of
+    /// automata in all.
     fn default() -> Self {
         RegexCacheOptions {
             capacity: 64,
             max_pattern_len: 4096,
+            max_bytes: 64 << 20,
         }
     }
 }
@@ -74,8 +101,10 @@ impl RegexCacheOptions {
     /// A compiled pattern takes up to the size limit it was compiled under
     /// (10 MiB by default, see
     /// [`RuntimeOptions::with_regex_size_limit`](crate::RuntimeOptions::with_regex_size_limit)),
-    /// plus, for each thread matching it at once, a lazy DFA cache of up to
-    /// 2 MiB (or the size limit, when smaller).
+    /// plus its scratch space, see [Memory](Self#memory).
+    ///
+    /// Making room scans the entries, under the lock insertions take: a
+    /// capacity in the low thousands at most is sensible.
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
         self
@@ -96,6 +125,22 @@ impl RegexCacheOptions {
     /// The longest pattern, in bytes, the cache keeps.
     pub fn max_pattern_len(&self) -> usize {
         self.max_pattern_len
+    }
+
+    /// How many bytes of compiled automata the cache keeps at most, in all:
+    /// the sum of their sizes, an invalid pattern counting its error message.
+    /// The entries used least recently are evicted to stay under it, and a
+    /// pattern larger on its own is not kept. Pinned patterns do not count,
+    /// and neither does the scratch space of matches, see
+    /// [Memory](Self#memory).
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// How many bytes of compiled automata the cache keeps at most.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
     }
 }
 
@@ -130,6 +175,8 @@ struct State {
     index: Index,
     /// The entries that can be evicted.
     len: usize,
+    /// The bytes of the entries that can be evicted, see [`Slot::bytes`].
+    bytes: u64,
     /// The pinned entries, which are never evicted.
     pinned: usize,
 }
@@ -161,6 +208,7 @@ impl State {
             .expect("a full cache has an entry it can evict");
         let slot = remove(&mut self.index, &pattern, |slots| slots.swap_remove(index));
         self.len -= 1;
+        self.bytes -= slot.bytes;
         (pattern, slot)
     }
 }
@@ -185,6 +233,9 @@ struct Slot {
     compiled: Compiled,
     /// Kept by [`RegexCache::prewarm`]: never evicted.
     pinned: bool,
+    /// What the entry counts against [`RegexCacheOptions::with_max_bytes`]:
+    /// the size of the automaton, or of the error message.
+    bytes: u64,
     /// The tick the entry was inserted at, unique.
     inserted: u64,
     /// When the entry was last used: twice the tick of its insertion, or
@@ -219,6 +270,15 @@ pub(crate) struct Compiled {
 }
 
 impl Compiled {
+    /// The bytes the entry holds: the size of the automaton, or of the
+    /// error message.
+    fn bytes(&self) -> u64 {
+        match &self.regex {
+            Ok(_) => self.built,
+            Err(message) => message.len() as u64,
+        }
+    }
+
     /// The bytes of automaton compiling built, see the field.
     pub(crate) fn built(&self) -> u64 {
         self.built
@@ -299,6 +359,7 @@ impl RegexCache {
         self.any_pinned.store(false, Ordering::Relaxed);
         let mut evicted = vec![std::mem::take(&mut state.index)];
         state.len = 0;
+        state.bytes = 0;
         state.pinned = 0;
         for replica in self.replicas.iter() {
             evicted.push(std::mem::take(&mut *write(replica)));
@@ -313,10 +374,11 @@ impl RegexCache {
     /// pins it: every such evaluation that matches it is then charged as a
     /// hit, whatever other evaluations add to the cache.
     ///
-    /// A pinned pattern is never evicted, and does not count against the
-    /// [capacity](RegexCacheOptions::with_capacity) of the cache, whatever
-    /// its size or length: only [`unpin`](Self::unpin) and
-    /// [`clear`](Self::clear) drop it. Pin only the patterns you trust, such as those of the rules
+    /// A pinned pattern is never evicted, and counts neither against the
+    /// [capacity](RegexCacheOptions::with_capacity) nor against the
+    /// [bytes](RegexCacheOptions::with_max_bytes) of the cache, whatever its
+    /// size or length: only [`unpin`](Self::unpin) and [`clear`](Self::clear)
+    /// drop it. Pin only the patterns you trust, such as those of the rules
     /// you load.
     ///
     /// Under a budget, a pattern that is not pinned is charged its compile
@@ -376,8 +438,9 @@ impl RegexCache {
                 return slot.compiled.clone();
             }
             let slot = slot.clone();
-            removed.push((remove_slot(&mut state.index, pattern, &slot), slot));
             state.len -= 1;
+            state.bytes -= slot.bytes;
+            removed.push((remove_slot(&mut state.index, pattern, &slot), slot));
         }
         let pattern = self.add(&mut state, pattern, size_limit, compiled.clone(), true);
         state.pinned += 1;
@@ -435,12 +498,17 @@ impl RegexCache {
             slot.used_at(self.tick.load(Ordering::Relaxed));
             return slot.compiled.clone();
         }
+        let bytes = compiled.bytes();
+        if bytes > self.options.max_bytes {
+            return compiled;
+        }
         let mut evicted = Vec::new();
-        while state.len >= self.options.capacity {
+        while state.len >= self.options.capacity || state.bytes + bytes > self.options.max_bytes {
             evicted.push(state.evict_least_recently_used());
         }
         let added = self.add(&mut state, pattern, size_limit, compiled.clone(), false);
         state.len += 1;
+        state.bytes += bytes;
         self.apply(&evicted, Some(&added));
         // the evicted regexes are freed after the locks are released
         drop(state);
@@ -461,6 +529,7 @@ impl RegexCache {
         let tick = self.next_tick();
         let slot = Arc::new(Slot {
             size_limit,
+            bytes: compiled.bytes(),
             compiled,
             pinned,
             inserted: tick,
@@ -878,6 +947,45 @@ mod tests {
         cache.clear();
         assert!(cache.is_empty());
         assert_eq!(cache.pinned_len(), 0);
+    }
+
+    #[test]
+    fn the_bytes_of_the_automata_are_capped() {
+        let size = |pattern: &str| compile(pattern, DEFAULT).bytes();
+        let (a, b, c) = (size("a+"), size("b+"), size("c+"));
+        let cache = RegexCache::new(RegexCacheOptions::default().with_max_bytes(a + b));
+        cache.get("a+", DEFAULT);
+        cache.get("b+", DEFAULT);
+        assert_eq!(cache.len(), 2);
+        // `c+` needs the room of the least recently used, `a+`
+        cache.get("c+", DEFAULT);
+        assert_eq!(
+            keys(&cache),
+            [format!("b+@{DEFAULT}"), format!("c+@{DEFAULT}")]
+        );
+        assert_eq!(cache.state().bytes, b + c);
+        // a pattern larger than the cap on its own is not kept
+        assert!(size(r"\w{10}") > a + b);
+        assert_eq!(cache.get(r"\w{10}", DEFAULT).is_match("a"), Ok(false));
+        assert_eq!(
+            keys(&cache),
+            [format!("b+@{DEFAULT}"), format!("c+@{DEFAULT}")]
+        );
+        // pinned patterns are not counted
+        cache.prewarm(r"\w{10}", 0).unwrap();
+        assert_eq!(cache.state().bytes, b + c);
+        assert_eq!(cache.len(), 3);
+        // an error counts its message
+        let error = compile("(", DEFAULT);
+        assert_eq!(
+            error.bytes(),
+            "'(' not a valid regex:\n".len() as u64 + {
+                let pattern = "(";
+                regex::Regex::new(pattern).unwrap_err().to_string().len() as u64
+            }
+        );
+        cache.clear();
+        assert_eq!(cache.state().bytes, 0);
     }
 
     #[test]
