@@ -94,7 +94,8 @@ impl From<CelMapKey<'_>> for Key {
         match value {
             CelMapKey::Bool(b) => b.into_inner().into(),
             CelMapKey::Int(i) => i.into_inner().into(),
-            CelMapKey::String(s) => s.into_inner().into(),
+            // shares an owned string's buffer, copies a borrowed one
+            CelMapKey::String(s) => Key::String(s.to_arc()),
             CelMapKey::UInt(u) => u.into_inner().into(),
         }
     }
@@ -106,7 +107,7 @@ impl From<Key> for CelMapKey<'_> {
             Key::Int(i) => CelMapKey::from(i),
             Key::Uint(u) => CelMapKey::from(u),
             Key::Bool(b) => CelMapKey::from(b),
-            Key::String(s) => CelMapKey::from(Arc::unwrap_or_clone(s)),
+            Key::String(s) => CelMapKey::String(CelString::from(s)),
         }
     }
 }
@@ -902,13 +903,9 @@ impl<'b, 'v> TryFrom<&'b (dyn Val + 'v)> for Value {
             Kind::Int => Ok(Value::Int(*built_in::<CelInt>(v)?.inner())),
             Kind::UInt => Ok(Value::UInt(*built_in::<CelUInt>(v)?.inner())),
             Kind::Double => Ok(Value::Float(*built_in::<CelDouble>(v)?.inner())),
-            Kind::String => Ok(Value::String(Arc::new(
-                built_in::<CelString>(v)?.inner().to_string(),
-            ))),
+            Kind::String => Ok(Value::String(built_in::<CelString>(v)?.to_arc())),
             Kind::NullType => Ok(Value::Null),
-            Kind::Bytes => Ok(Value::Bytes(Arc::new(
-                built_in::<CelBytes>(v)?.inner().to_vec(),
-            ))),
+            Kind::Bytes => Ok(Value::Bytes(built_in::<CelBytes>(v)?.to_arc())),
             #[cfg(feature = "chrono")]
             Kind::Duration => Ok(Value::Duration(*built_in::<CelDuration>(v)?.inner())),
             #[cfg(feature = "chrono")]
@@ -968,24 +965,33 @@ impl TryFrom<Value> for Box<dyn Val> {
             Value::Int(i) => Ok(Box::new(CelInt::from(i))),
             Value::UInt(u) => Ok(Box::new(CelUInt::from(u))),
             Value::Float(f) => Ok(Box::new(CelDouble::from(f))),
-            Value::String(s) => Ok(Box::new(CelString::from(Arc::unwrap_or_clone(s)))),
+            Value::String(s) => Ok(Box::new(CelString::from(s))),
             Value::Null => Ok(Box::new(CelNull)),
-            Value::Bytes(b) => Ok(Box::new(CelBytes::from(b.as_slice().to_vec()))),
+            Value::Bytes(b) => Ok(Box::new(CelBytes::from(b))),
             #[cfg(feature = "chrono")]
             Value::Duration(d) => Ok(Box::new(CelDuration::from(d))),
             #[cfg(feature = "chrono")]
             Value::Timestamp(ts) => Ok(Box::new(CelTimestamp::from(ts))),
+            // Move the items out of a list or map no one else holds, and
+            // otherwise clone them one at a time: either way the strings,
+            // bytes and nested containers are shared, not copied.
             Value::List(l) => {
-                let result: Result<Vec<Box<dyn Val>>, ExecutionError> =
-                    (*l).clone().into_iter().map(|i| i.try_into()).collect();
+                let result: Result<Vec<Box<dyn Val>>, ExecutionError> = match Arc::try_unwrap(l) {
+                    Ok(l) => l.into_iter().map(Box::<dyn Val>::try_from).collect(),
+                    Err(l) => l.iter().map(|i| i.clone().try_into()).collect(),
+                };
                 Ok(Box::new(CelList::from(result?)))
             }
             Value::Map(map) => {
-                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> = (*map.map)
-                    .clone()
-                    .into_iter()
-                    .map(|(k, v)| v.clone().try_into().map(|v| (k.clone().into(), v)))
-                    .collect();
+                let entry = |(k, v): (Key, Value)| v.try_into().map(|v| (CelMapKey::from(k), v));
+                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> =
+                    match Arc::try_unwrap(map.map) {
+                        Ok(m) => m.into_iter().map(entry).collect(),
+                        Err(m) => m
+                            .iter()
+                            .map(|(k, v)| entry((k.clone(), v.clone())))
+                            .collect(),
+                    };
                 Ok(Box::new(CelMap::from(result?)))
             }
             Value::Opaque(o) => {
@@ -1707,7 +1713,7 @@ impl<'e> AppendStep<'e> {
                     continue;
                 }
             }
-            accu.extend(Value::resolve_val(self.items, &ctx)?.as_ref())?;
+            accu.extend_owned(Value::resolve_val(self.items, &ctx)?)?;
         }
         Ok(CowVal::owned(accu.to_immutable()))
     }
@@ -2762,6 +2768,155 @@ mod tests {
         let result = p.execute(&ctx);
 
         assert!(result.is_err(), "Should error on missing map key");
+    }
+
+    /// Strings, bytes, lists and maps are shared with the [`Value`]s they are
+    /// converted from and to, not copied.
+    mod sharing {
+        use crate::common::types::{Type, DYN_TYPE};
+        use crate::common::value::Val;
+        use crate::objects::{Key, Map};
+        use crate::{Context, Program, Value};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        fn execute(ctx: &Context, expr: &str) -> Value {
+            Program::compile(expr).unwrap().execute(ctx).unwrap()
+        }
+
+        #[test]
+        fn string_roundtrip_shares() {
+            let arc = Arc::new("cel-rust".to_owned());
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("s", Value::String(arc.clone()));
+            let Value::String(out) = execute(&ctx, "s") else {
+                panic!("expected a string")
+            };
+            assert!(Arc::ptr_eq(&out, &arc));
+        }
+
+        /// A value that counts how often it is cloned.
+        #[derive(Debug)]
+        struct Counted(Arc<AtomicUsize>);
+
+        impl Val for Counted {
+            fn get_type(&self) -> &Type {
+                &DYN_TYPE
+            }
+
+            fn cel_type() -> &'static Type {
+                &DYN_TYPE
+            }
+
+            fn clone_as_boxed<'v>(&self) -> Box<dyn Val + 'v> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::new(Counted(self.0.clone()))
+            }
+        }
+
+        fn clones_of(expr: &str) -> usize {
+            let clones = Arc::new(AtomicUsize::new(0));
+            let mut ctx = Context::default();
+            ctx.add_variable_as_val("v", Box::new(Counted(clones.clone())));
+            let program = Program::compile(expr).unwrap();
+            let size = match program.execute(&ctx) {
+                Ok(Value::Int(size)) => size,
+                other => panic!("expected the size, got {other:?}"),
+            };
+            assert_eq!(size, 3);
+            clones.load(Ordering::Relaxed)
+        }
+
+        #[test]
+        fn map_moves_the_built_elements() {
+            // one clone per iteration, to build `[v]`; appending it moves it
+            assert_eq!(clones_of("size([1, 2, 3].map(x, v))"), 3);
+        }
+
+        #[test]
+        fn filter_moves_the_built_elements() {
+            // `[v, v, v]` clones `v` 3 times, binding `x` and building `[x]` once
+            // per iteration each; appending `[x]` moves it
+            assert_eq!(clones_of("size([v, v, v].filter(x, true))"), 9);
+        }
+
+        #[test]
+        fn bytes_roundtrip_shares() {
+            let arc = Arc::new(vec![1u8, 2, 3]);
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("b", Value::Bytes(arc.clone()));
+            let Value::Bytes(out) = execute(&ctx, "b") else {
+                panic!("expected bytes")
+            };
+            assert!(Arc::ptr_eq(&out, &arc));
+        }
+
+        #[test]
+        fn bytes_argument_shares() {
+            let arc = Arc::new(vec![1u8, 2, 3]);
+            let mut ctx = Context::default();
+            ctx.add_function("addr", |b: Arc<Vec<u8>>| Arc::as_ptr(&b) as usize as u64)
+                .unwrap();
+            ctx.add_variable_from_value("b", Value::Bytes(arc.clone()));
+            assert_eq!(
+                execute(&ctx, "addr(b)"),
+                Value::UInt(Arc::as_ptr(&arc) as usize as u64)
+            );
+        }
+
+        #[test]
+        fn list_roundtrip_shares_the_elements() {
+            let arc = Arc::new("cel-rust".to_owned());
+            let list = Value::List(Arc::new(vec![Value::String(arc.clone())]));
+            let mut ctx = Context::default();
+            // `list` is still held here, so the conversion cannot take it apart
+            ctx.add_variable_from_value("l", list.clone());
+            let Value::List(out) = execute(&ctx, "l") else {
+                panic!("expected a list")
+            };
+            let Value::String(out) = &out[0] else {
+                panic!("expected a string")
+            };
+            assert!(Arc::ptr_eq(out, &arc));
+        }
+
+        #[test]
+        fn map_roundtrip_shares_the_keys_and_values() {
+            let key = Arc::new("key".to_owned());
+            let value = Arc::new("value".to_owned());
+            let map = Value::Map(Map {
+                map: Arc::new(HashMap::from([(
+                    Key::String(key.clone()),
+                    Value::String(value.clone()),
+                )])),
+            });
+            let mut ctx = Context::default();
+            // `map` is still held here, so the conversion cannot take it apart
+            ctx.add_variable_from_value("m", map.clone());
+            let Value::Map(out) = execute(&ctx, "m") else {
+                panic!("expected a map")
+            };
+            let (Key::String(out_key), Value::String(out_value)) = out.map.iter().next().unwrap()
+            else {
+                panic!("expected a string entry")
+            };
+            assert!(Arc::ptr_eq(out_key, &key));
+            assert!(Arc::ptr_eq(out_value, &value));
+        }
+
+        #[test]
+        fn string_argument_shares() {
+            let arc = Arc::new("cel-rust".to_owned());
+            let mut ctx = Context::default();
+            ctx.add_function("addr", |s: Arc<String>| Arc::as_ptr(&s) as usize as u64)
+                .unwrap();
+            ctx.add_variable_from_value("s", Value::String(arc.clone()));
+            assert_eq!(
+                execute(&ctx, "addr(s)"),
+                Value::UInt(Arc::as_ptr(&arc) as usize as u64)
+            );
+        }
     }
 
     /// `has()` asks whether the value has the field, whatever its kind: as

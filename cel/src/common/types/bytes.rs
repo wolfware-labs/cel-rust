@@ -4,27 +4,48 @@ use crate::common::value::{Builtin, BuiltinRef, CowVal, Val};
 use crate::Value;
 use crate::{common::traits, ExecutionError};
 use std::borrow::Cow;
+use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
 use traits::{Adder, Comparer};
 
-/// CEL bytes. Owns the buffer, or borrows it for `'a`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Bytes<'a>(Cow<'a, [u8]>);
+/// CEL bytes. Shares the buffer, or borrows it for `'a`.
+///
+/// An owned buffer is held in an [`Arc`], so cloning is O(1) whether the
+/// bytes are owned or borrowed, and converting to and from
+/// [`Value::Bytes`](crate::Value::Bytes) shares the buffer.
+#[derive(Clone)]
+pub struct Bytes<'a>(Repr<'a>);
+
+#[derive(Clone)]
+enum Repr<'a> {
+    Borrowed(&'a [u8]),
+    Shared(Arc<Vec<u8>>),
+}
 
 impl<'a> Bytes<'a> {
-    /// The bytes, copied out if they were borrowed.
+    /// The bytes, moved out when they are owned and not shared, copied
+    /// otherwise.
     pub fn into_inner(self) -> Vec<u8> {
-        self.0.into_owned()
+        match self.0 {
+            Repr::Borrowed(b) => b.to_vec(),
+            Repr::Shared(b) => Arc::unwrap_or_clone(b),
+        }
     }
 
     pub fn inner(&self) -> &[u8] {
-        &self.0
+        match &self.0 {
+            Repr::Borrowed(b) => b,
+            Repr::Shared(b) => b.as_slice(),
+        }
     }
 
     /// Copies the bytes out if they were borrowed, so the result owns them.
     pub fn into_static(self) -> Bytes<'static> {
-        Bytes(Cow::Owned(self.0.into_owned()))
+        match self.0 {
+            Repr::Borrowed(b) => Bytes::from(b.to_vec()),
+            Repr::Shared(b) => Bytes(Repr::Shared(b)),
+        }
     }
 
     /// The bytes, with the lifetime of the borrow itself, if they are borrowed
@@ -36,9 +57,46 @@ impl<'a> Bytes<'a> {
     /// re-borrowed, without a copy, for as long as the container's own data.
     pub fn as_borrowed(&self) -> Option<&'a [u8]> {
         match &self.0 {
-            Cow::Borrowed(b) => Some(b),
-            Cow::Owned(_) => None,
+            Repr::Borrowed(b) => Some(b),
+            Repr::Shared(_) => None,
         }
+    }
+
+    /// The shared buffer, if the bytes are owned rather than borrowed.
+    ///
+    /// Cloning the `Arc` hands the bytes out without copying them.
+    pub fn as_arc(&self) -> Option<&Arc<Vec<u8>>> {
+        match &self.0 {
+            Repr::Borrowed(_) => None,
+            Repr::Shared(b) => Some(b),
+        }
+    }
+
+    /// The bytes as an `Arc`: the shared buffer when owned, a copy when
+    /// borrowed.
+    pub(crate) fn to_arc(&self) -> Arc<Vec<u8>> {
+        match &self.0 {
+            Repr::Borrowed(b) => Arc::new(b.to_vec()),
+            Repr::Shared(b) => Arc::clone(b),
+        }
+    }
+}
+
+impl Default for Bytes<'_> {
+    fn default() -> Self {
+        Bytes(Repr::Borrowed(&[]))
+    }
+}
+
+impl Debug for Bytes<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Bytes").field(&self.inner()).finish()
+    }
+}
+
+impl PartialEq for Bytes<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner() == other.inner()
     }
 }
 
@@ -81,7 +139,7 @@ impl<'a> Val for Bytes<'a> {
     fn equals(&self, other: &dyn Val) -> bool {
         other
             .downcast_ref::<Bytes>()
-            .is_some_and(|a| self.0.eq(&a.0))
+            .is_some_and(|a| self.inner() == a.inner())
     }
 
     fn clone_as_boxed<'v>(&self) -> Box<dyn Val + 'v>
@@ -112,9 +170,9 @@ impl<'a> Adder for Bytes<'a> {
         Self: 'v,
     {
         if let Some(bytes) = other.downcast_ref::<Bytes>() {
-            let mut v = Vec::with_capacity(self.0.len() + bytes.0.len());
-            v.extend_from_slice(&self.0);
-            v.extend_from_slice(&bytes.0);
+            let mut v = Vec::with_capacity(self.len() + bytes.len());
+            v.extend_from_slice(self);
+            v.extend_from_slice(bytes);
             Ok(CowVal::owned(Bytes::from(v)))
         } else {
             Err(ExecutionError::UnsupportedBinaryOperator(
@@ -129,7 +187,7 @@ impl<'a> Adder for Bytes<'a> {
 impl Comparer for Bytes<'_> {
     fn compare(&self, other: &dyn Val) -> Result<std::cmp::Ordering, ExecutionError> {
         if let Some(bytes) = other.downcast_ref::<Bytes>() {
-            Ok(self.0.cmp(&bytes.0))
+            Ok(self.inner().cmp(bytes.inner()))
         } else {
             Err(crate::ExecutionError::values_not_comparable(self, other))
         }
@@ -150,33 +208,31 @@ impl Zeroer for Bytes<'_> {
 
 impl From<Vec<u8>> for Bytes<'_> {
     fn from(value: Vec<u8>) -> Self {
-        Bytes(Cow::Owned(value))
+        Bytes(Repr::Shared(Arc::new(value)))
     }
 }
 
 /// Borrows the slice: no copy is made.
 impl<'a> From<&'a [u8]> for Bytes<'a> {
     fn from(value: &'a [u8]) -> Self {
-        Bytes(Cow::Borrowed(value))
+        Bytes(Repr::Borrowed(value))
     }
 }
 
+/// Shares the buffer: no copy is made.
 impl From<Arc<Vec<u8>>> for Bytes<'_> {
     fn from(v: Arc<Vec<u8>>) -> Self {
-        match Arc::try_unwrap(v) {
-            Ok(b) => Bytes(Cow::Owned(b)),
-            Err(v) => Bytes(Cow::Owned((*v).clone())),
-        }
+        Bytes(Repr::Shared(v))
     }
 }
 
 /// Reinterprets the string's bytes, keeping a borrow borrowed.
 impl<'a> From<CelString<'a>> for Bytes<'a> {
     fn from(value: CelString<'a>) -> Self {
-        Bytes(match value.into_cow() {
-            Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-            Cow::Owned(s) => Cow::Owned(s.into_bytes()),
-        })
+        match value.into_cow() {
+            Cow::Borrowed(s) => Bytes::from(s.as_bytes()),
+            Cow::Owned(s) => Bytes::from(s.into_bytes()),
+        }
     }
 }
 
@@ -252,7 +308,8 @@ fn size(this: &Bytes<'_>) -> CelInt {
 mod tests {
     use super::Bytes;
     use crate::common::types::CelString;
-    use crate::common::value::CowVal;
+    use crate::common::value::{CowVal, Val};
+    use std::sync::Arc;
 
     #[test]
     fn as_borrowed_outlives_the_bytes() {
@@ -265,6 +322,52 @@ mod tests {
         assert_eq!(tail, Some(&[2u8, 3, 4][..]));
         assert!(std::ptr::eq(tail.unwrap().as_ptr(), owned[1..].as_ptr()));
         assert_eq!(Bytes::from(vec![1u8]).as_borrowed(), None);
+    }
+
+    #[test]
+    fn clone_is_shallow() {
+        let b = Bytes::from(vec![1u8, 2, 3]);
+        let cloned = b.clone();
+        assert!(std::ptr::eq(b.inner(), cloned.inner()));
+        let boxed = b.clone_as_boxed();
+        let back = boxed.downcast_ref::<Bytes>().unwrap();
+        assert!(std::ptr::eq(b.inner(), back.inner()));
+    }
+
+    #[test]
+    fn from_a_shared_arc_shares_it() {
+        let arc = Arc::new(vec![1u8, 2, 3]);
+        let b = Bytes::from(arc.clone());
+        assert!(std::ptr::eq(b.inner(), arc.as_slice()));
+        assert!(std::ptr::eq(
+            b.clone().into_static().inner(),
+            arc.as_slice()
+        ));
+    }
+
+    #[test]
+    fn into_inner_of_shared_bytes_leaves_them_intact() {
+        let b = Bytes::from(vec![1u8]);
+        let shared = b.clone();
+        let mut inner = b.into_inner();
+        inner.push(2);
+        assert_eq!(shared.inner(), &[1u8]);
+    }
+
+    #[test]
+    fn debug_shows_the_bytes() {
+        assert_eq!(format!("{:?}", Bytes::from(&[1u8, 2][..])), "Bytes([1, 2])");
+        assert_eq!(format!("{:?}", Bytes::from(vec![1u8, 2])), "Bytes([1, 2])");
+    }
+
+    #[test]
+    fn bytes_of_owned_string_moves_the_buffer() {
+        let s = CelString::from(String::from("cel"));
+        let ptr = s.inner().as_ptr();
+        let arg: CowVal<'_, '_> = CowVal::owned(s);
+        let out = super::string_to_bytes(vec![arg]).unwrap();
+        let b = out.downcast_ref::<Bytes>().unwrap();
+        assert!(std::ptr::eq(b.inner().as_ptr(), ptr));
     }
 
     #[test]
