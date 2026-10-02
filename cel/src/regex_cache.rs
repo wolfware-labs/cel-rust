@@ -7,15 +7,27 @@
 //! sized by the limit too. A pattern that fails to compile, for its syntax
 //! or its size, is kept as its error.
 //!
-//! Compiling happens outside the lock, and so does matching: a lookup only
-//! clones the entry's `Arc`. When the cache is full, the entry used least
-//! recently is evicted: every lookup and insertion takes a unique tick, so
-//! the choice is deterministic.
+//! Hits do not exclude each other. The index of the entries is replicated,
+//! a replica per core: a hit takes its thread's replica shared, finds the
+//! entry and clones its `Arc`, so hits on threads of different groups touch
+//! no common lock, and hits sharing a replica only share its lock. Compiling
+//! and matching happen outside every lock. An insertion is decided under
+//! one mutex, and then applied to each replica under its lock, exclusively.
+//!
+//! When the cache is full, the entry used least recently is evicted, found
+//! by a scan of the entries under the mutex: a capacity in the low thousands
+//! at most is sensible. Every insertion takes a tick from a counter, and a
+//! hit marks its entry used at the latest tick, so that recency is tracked
+//! between insertions: the entries used since the last insertion count as
+//! equally recent, and among them the earliest inserted is evicted first. A
+//! sequence of uses on one thread always evicts the same entries; uses
+//! racing on several threads are ordered by the ticks they saw.
 
 use crate::ExecutionError;
 use regex_automata::{meta, util::syntax, MatchKind};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The `regex` crate's default limit on the size of a compiled pattern.
 const NFA_SIZE_LIMIT: usize = 10 << 20;
@@ -91,60 +103,100 @@ impl RegexCacheOptions {
 /// shared by every evaluation under it, see [`RegexCacheOptions`].
 pub struct RegexCache {
     options: RegexCacheOptions,
-    inner: Mutex<Inner>,
+    /// The last tick handed out, see [`next_tick`](Self::next_tick).
+    tick: AtomicU64,
+    /// The entries, as insertions and evictions see them: each is decided
+    /// under this lock, and then applied to every replica.
+    state: Mutex<State>,
+    /// Copies of the index of the entries, one per group of threads. A hit
+    /// takes its own replica's lock, shared: hits on threads of different
+    /// groups touch no common lock, and hits in one group do not exclude
+    /// each other.
+    replicas: Box<[Replica]>,
 }
+
+/// The entries of each pattern, one per size limit.
+type Index = HashMap<Arc<str>, Vec<Arc<Slot>>>;
+
+/// A replica of the index, on a cache line of its own.
+#[derive(Default)]
+#[repr(align(128))]
+struct Replica(RwLock<Index>);
 
 #[derive(Default)]
-struct Inner {
-    /// The entries of each pattern, one per size limit.
-    map: HashMap<Arc<str>, Vec<Slot>>,
+struct State {
+    index: Index,
     len: usize,
-    tick: u64,
 }
 
-impl Inner {
-    /// A tick no other use of the cache has.
-    fn next_tick(&mut self) -> u64 {
-        self.tick += 1;
-        self.tick
-    }
+fn find<'a>(index: &'a Index, pattern: &str, size_limit: usize) -> Option<&'a Arc<Slot>> {
+    index
+        .get(pattern)?
+        .iter()
+        .find(|slot| slot.size_limit == size_limit)
+}
 
-    fn slot(&mut self, pattern: &str, size_limit: usize) -> Option<&mut Slot> {
-        self.map
-            .get_mut(pattern)?
-            .iter_mut()
-            .find(|slot| slot.size_limit == size_limit)
-    }
-
-    /// Removes the entry used least recently, which the unique ticks make
-    /// one entry, whatever the order of the map. The cache is not empty.
-    fn evict_least_recently_used(&mut self) -> Compiled {
-        let (pattern, index) = self
-            .map
-            .iter()
-            .flat_map(|(pattern, slots)| {
-                slots
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, slot)| (slot.last_used, pattern, index))
-            })
-            .min_by_key(|(last_used, _, _)| *last_used)
-            .map(|(_, pattern, index)| (pattern.clone(), index))
-            .expect("a full cache has an entry");
-        let slots = self.map.get_mut(&pattern).expect("the pattern is kept");
-        let slot = slots.swap_remove(index);
-        if slots.is_empty() {
-            self.map.remove(&pattern);
-        }
+impl State {
+    /// Removes the entry used least recently, the earliest inserted first
+    /// among those used as recently, which makes it one entry, whatever the
+    /// order of the map. The cache is not empty.
+    fn evict_least_recently_used(&mut self) -> (Arc<str>, Arc<Slot>) {
+        let (pattern, index) =
+            self.index
+                .iter()
+                .flat_map(|(pattern, slots)| {
+                    slots.iter().enumerate().map(move |(index, slot)| {
+                        ((slot.last_used(), slot.inserted), pattern, index)
+                    })
+                })
+                .min_by_key(|(recency, _, _)| *recency)
+                .map(|(_, pattern, index)| (pattern.clone(), index))
+                .expect("a full cache has an entry");
+        let slot = remove(&mut self.index, &pattern, |slots| slots.swap_remove(index));
         self.len -= 1;
-        slot.compiled
+        (pattern, slot)
     }
+}
+
+/// Removes the slot `take` picks from the entries of `pattern`, and the
+/// pattern with its last entry.
+fn remove(
+    index: &mut Index,
+    pattern: &str,
+    take: impl FnOnce(&mut Vec<Arc<Slot>>) -> Arc<Slot>,
+) -> Arc<Slot> {
+    let slots = index.get_mut(pattern).expect("the pattern is kept");
+    let slot = take(slots);
+    if slots.is_empty() {
+        index.remove(pattern);
+    }
+    slot
 }
 
 struct Slot {
     size_limit: usize,
     compiled: Compiled,
-    last_used: u64,
+    /// The tick the entry was inserted at, unique.
+    inserted: u64,
+    /// When the entry was last used: twice the tick of its insertion, or
+    /// twice the tick current at a hit, plus one.
+    last_used: AtomicU64,
+}
+
+impl Slot {
+    fn last_used(&self) -> u64 {
+        self.last_used.load(Ordering::Relaxed)
+    }
+
+    /// Marks the entry used now, `tick` being the latest tick handed out:
+    /// as recent as any use since that insertion, and more than it. Writes
+    /// only the first time in a tick, so hits mostly only read.
+    fn used_at(&self, tick: u64) {
+        let stamp = tick.saturating_mul(2) | 1;
+        if self.last_used() < stamp {
+            self.last_used.fetch_max(stamp, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A pattern compiled under a size limit: the regex, or the error `matches`
@@ -183,12 +235,28 @@ impl Default for RegexCache {
     }
 }
 
+/// The group of threads this thread belongs to: a number given out in
+/// turn, at the thread's first hit.
+fn thread_group() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static GROUP: usize = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    GROUP.with(|group| *group)
+}
+
 impl RegexCache {
     /// An empty cache.
     pub fn new(options: RegexCacheOptions) -> Self {
+        // a replica per core: threads beyond share them
+        let replicas = std::thread::available_parallelism()
+            .map_or(1, |cores| cores.get())
+            .clamp(1, 64);
         RegexCache {
             options,
-            inner: Mutex::default(),
+            tick: AtomicU64::new(0),
+            state: Mutex::default(),
+            replicas: (0..replicas).map(|_| Replica::default()).collect(),
         }
     }
 
@@ -200,7 +268,7 @@ impl RegexCache {
     /// How many compiled patterns the cache holds, counting a pattern once
     /// per size limit it was compiled under.
     pub fn len(&self) -> usize {
-        self.lock().len
+        self.state().len
     }
 
     /// Whether the cache holds no compiled pattern.
@@ -210,7 +278,15 @@ impl RegexCache {
 
     /// Drops every compiled pattern.
     pub fn clear(&self) {
-        let evicted = std::mem::take(&mut *self.lock());
+        let mut state = self.state();
+        let mut evicted = vec![std::mem::take(&mut *state)];
+        for replica in self.replicas.iter() {
+            evicted.push(State {
+                index: std::mem::take(&mut *write(replica)),
+                len: 0,
+            });
+        }
+        drop(state);
         drop(evicted);
     }
 
@@ -246,10 +322,21 @@ impl RegexCache {
             .map(|_| ())
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        // the map is consistent between statements: a panic cannot leave it
-        // half-updated
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    // The maps are consistent between statements: a panic cannot leave one
+    // half-updated, so a poisoned lock is used as is.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// This thread's replica.
+    fn replica(&self) -> RwLockReadGuard<'_, Index> {
+        let replica = &self.replicas[thread_group() % self.replicas.len()];
+        replica.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A tick no other insertion has, later than every earlier one.
+    fn next_tick(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Whether the cache keeps `pattern`.
@@ -258,15 +345,15 @@ impl RegexCache {
     }
 
     /// The compiled `pattern` under `size_limit`, if the cache holds it,
-    /// marked as used.
+    /// marked as used. Takes this thread's replica shared, and only reads
+    /// shared memory, but for the first hit on an entry since an insertion.
     pub(crate) fn lookup(&self, pattern: &str, size_limit: usize) -> Option<Compiled> {
         if !self.keeps(pattern) {
             return None;
         }
-        let mut inner = self.lock();
-        let tick = inner.next_tick();
-        let slot = inner.slot(pattern, size_limit)?;
-        slot.last_used = tick;
+        let index = self.replica();
+        let slot = find(&index, pattern, size_limit)?;
+        slot.used_at(self.tick.load(Ordering::Relaxed));
         Some(slot.compiled.clone())
     }
 
@@ -277,36 +364,49 @@ impl RegexCache {
         if !self.keeps(pattern) {
             return compiled;
         }
-        let mut evicted = Vec::new();
-        let mut inner = self.lock();
-        let tick = inner.next_tick();
-        if let Some(slot) = inner.slot(pattern, size_limit) {
-            slot.last_used = tick;
+        let mut state = self.state();
+        if let Some(slot) = find(&state.index, pattern, size_limit) {
+            slot.used_at(self.tick.load(Ordering::Relaxed));
             return slot.compiled.clone();
         }
-        while inner.len >= self.options.capacity {
-            evicted.push(inner.evict_least_recently_used());
+        let mut evicted = Vec::new();
+        while state.len >= self.options.capacity {
+            evicted.push(state.evict_least_recently_used());
         }
-        let slot = Slot {
+        let tick = self.next_tick();
+        let slot = Arc::new(Slot {
             size_limit,
             compiled: compiled.clone(),
-            last_used: tick,
+            inserted: tick,
+            last_used: AtomicU64::new(tick.saturating_mul(2)),
+        });
+        let pattern: Arc<str> = match state.index.get_key_value(pattern) {
+            Some((kept, _)) => kept.clone(),
+            None => pattern.into(),
         };
-        match inner.map.get_mut(pattern) {
-            Some(slots) => slots.push(slot),
-            None => {
-                inner.map.insert(pattern.into(), vec![slot]);
+        add(&mut state.index, &pattern, &slot);
+        state.len += 1;
+        for replica in self.replicas.iter() {
+            let mut index = write(replica);
+            for (pattern, slot) in &evicted {
+                remove(&mut index, pattern, |slots| {
+                    let at = slots
+                        .iter()
+                        .position(|kept| Arc::ptr_eq(kept, slot))
+                        .expect("the replica holds the entry");
+                    slots.swap_remove(at)
+                });
             }
+            add(&mut index, &pattern, &slot);
         }
-        inner.len += 1;
-        // the evicted regexes are freed after the lock is released
-        drop(inner);
+        // the evicted regexes are freed after the locks are released
+        drop(state);
         drop(evicted);
         compiled
     }
 
     /// The compiled `pattern` under `size_limit`, compiling it, outside the
-    /// lock, when the cache does not hold it.
+    /// locks, when the cache does not hold it.
     pub(crate) fn get(&self, pattern: &str, size_limit: usize) -> Compiled {
         match self.lookup(pattern, size_limit) {
             Some(compiled) => compiled,
@@ -315,6 +415,13 @@ impl RegexCache {
     }
 }
 
+fn write(replica: &Replica) -> RwLockWriteGuard<'_, Index> {
+    replica.0.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn add(index: &mut Index, pattern: &Arc<str>, slot: &Arc<Slot>) {
+    index.entry(pattern.clone()).or_default().push(slot.clone());
+}
 /// Compiles `pattern` with the configuration of `regex::Regex::new`, so the
 /// result and the error messages are the same, under `size_limit`, which
 /// also caps the lazy DFA's cache.
@@ -367,9 +474,9 @@ mod tests {
     }
 
     fn keys(cache: &RegexCache) -> Vec<String> {
-        let inner = cache.lock();
-        let mut keys: Vec<String> = inner
-            .map
+        let state = cache.state();
+        let mut keys: Vec<String> = state
+            .index
             .iter()
             .flat_map(|(pattern, slots)| {
                 slots
@@ -378,6 +485,20 @@ mod tests {
             })
             .collect();
         keys.sort();
+        // every replica holds the same entries
+        for replica in cache.replicas.iter() {
+            let index = replica.0.read().unwrap();
+            let mut replicated: Vec<String> = index
+                .iter()
+                .flat_map(|(pattern, slots)| {
+                    slots
+                        .iter()
+                        .map(move |slot| format!("{pattern}@{}", slot.size_limit))
+                })
+                .collect();
+            replicated.sort();
+            assert_eq!(replicated, keys);
+        }
         keys
     }
 
@@ -473,15 +594,79 @@ mod tests {
         let cache = RegexCache::default();
         let compiled = cache.get("^a+$", DEFAULT);
         // the entry is held, and the lock is free
-        let guard = cache.inner.try_lock();
+        let guard = cache.state.try_lock();
         assert!(guard.is_ok());
         drop(guard);
+        for replica in cache.replicas.iter() {
+            assert!(replica.0.try_write().is_ok());
+        }
         assert_eq!(compiled.is_match(&"a".repeat(1 << 16)), Ok(true));
         // and another thread can use the cache meanwhile
         std::thread::scope(|scope| {
             scope.spawn(|| assert_eq!(cache.get("b", DEFAULT).is_match("b"), Ok(true)));
         });
         assert_eq!(compiled.is_match("b"), Ok(false));
+    }
+
+    #[test]
+    fn a_hit_takes_no_exclusive_lock() {
+        let cache = RegexCache::default();
+        let first = cache.get("a.c", DEFAULT);
+        // an insertion is under way, and other hits hold every replica
+        let inserting = cache.state();
+        let held: Vec<_> = cache
+            .replicas
+            .iter()
+            .map(|replica| replica.0.read().unwrap())
+            .collect();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| send.send(cache.lookup("a.c", DEFAULT)).unwrap());
+            let hit = receive
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a hit waits for no other use")
+                .expect("a hit");
+            assert!(same(&first, &hit));
+        });
+        drop(held);
+        drop(inserting);
+    }
+
+    #[test]
+    fn a_hit_marks_its_entry_once_per_tick() {
+        let cache = RegexCache::default();
+        cache.get("a", DEFAULT);
+        let state = cache.state();
+        let slot = find(&state.index, "a", DEFAULT).unwrap().clone();
+        drop(state);
+        // inserted at tick 1
+        assert_eq!(slot.last_used(), 2);
+        cache.lookup("a", DEFAULT);
+        assert_eq!(slot.last_used(), 3);
+        // a racing hit that saw an earlier tick does not go back
+        slot.used_at(0);
+        assert_eq!(slot.last_used(), 3);
+        cache.get("b", DEFAULT);
+        cache.lookup("a", DEFAULT);
+        assert_eq!(slot.last_used(), 5);
+    }
+
+    #[test]
+    fn hits_since_the_last_insertion_count_as_equally_recent() {
+        let cache = RegexCache::new(RegexCacheOptions::default().with_capacity(3));
+        for pattern in ["a", "b", "c", "c", "b", "a", "d"] {
+            cache.get(pattern, DEFAULT);
+        }
+        // `a`, `b` and `c` were all used since `c` was inserted: the
+        // earliest inserted of them goes
+        assert_eq!(
+            keys(&cache),
+            [
+                format!("b@{DEFAULT}"),
+                format!("c@{DEFAULT}"),
+                format!("d@{DEFAULT}")
+            ]
+        );
     }
 
     #[test]
@@ -524,8 +709,9 @@ mod tests {
             }
         });
         assert!(cache.len() <= 16);
-        let inner = cache.lock();
-        assert_eq!(inner.len, inner.map.values().map(Vec::len).sum::<usize>());
+        let len = cache.state().index.values().map(Vec::len).sum::<usize>();
+        assert_eq!(cache.len(), len);
+        keys(&cache);
     }
 
     #[test]
