@@ -23,9 +23,9 @@
 //! sequence of uses on one thread always evicts the same entries; uses
 //! racing on several threads are ordered by the ticks they saw.
 
+use crate::regex_scan::Scanner;
 use crate::ExecutionError;
 use regex_automata::{meta, util::syntax, MatchKind};
-use regex_syntax::hir::{Hir, HirKind, LookSet};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -66,9 +66,14 @@ pub(crate) fn size_limit(regex_size_limit: u64) -> usize {
 /// 2 MiB, or the size limit when smaller, and the state of the other
 /// engines, about the size of the automaton; about 0.6 MiB per pattern and
 /// thread was measured for patterns near 1 MiB. This memory is not counted
-/// by `max_bytes`. With `T` threads matching, the cache can so hold up to
+/// by `max_bytes`. Matches under a budget run automata of their own (see
+/// `regex_scan`), counted with the pattern's, with a second such pool of
+/// caches, each holding a lazy DFA of the same capacity: up to twice the
+/// scratch space for a pattern matched both with and without a budget.
+/// With `T` threads matching, the cache can so hold up to
 ///
-/// `max_bytes + capacity × T × (2 MiB + automaton)`, plus the pinned patterns.
+/// `max_bytes + capacity × T × 2 × (2 MiB + automaton)`, plus the pinned
+/// patterns.
 ///
 /// Without an evaluation budget, patterns compile under the `regex` crate's
 /// default limits, so an automaton is up to 10 MiB: with the defaults, at
@@ -270,10 +275,8 @@ pub(crate) struct Compiled {
     /// The bytes of automaton compiling built: the regex's size, the size
     /// limit when it was exceeded, zero when the pattern is invalid.
     built: u64,
-    /// How many Unicode word-boundary assertions the automaton holds, see
-    /// [`unicode_word_looks`]: with any, the lazy DFA cannot scan a
-    /// non-ASCII subject.
-    word_looks: u64,
+    /// The automata matching under a budget, see [`Scanner`].
+    scanner: Option<Arc<Scanner>>,
 }
 
 impl Compiled {
@@ -281,9 +284,20 @@ impl Compiled {
     /// error message.
     fn bytes(&self) -> u64 {
         match &self.regex {
-            Ok(_) => self.built,
+            Ok(_) => self.built.saturating_add(self.scanner_bytes()),
             Err(message) => message.len() as u64,
         }
+    }
+
+    /// The bytes of the automata matching under a budget, see [`Scanner`].
+    pub(crate) fn scanner_bytes(&self) -> u64 {
+        self.scanner.as_ref().map_or(0, |scanner| scanner.bytes())
+    }
+
+    /// The automata matching under a budget, see [`Scanner`]: `None` for an
+    /// invalid pattern.
+    pub(crate) fn scanner(&self) -> Option<&Scanner> {
+        self.scanner.as_deref()
     }
 
     /// The bytes of automaton compiling built, see the field.
@@ -291,30 +305,14 @@ impl Compiled {
         self.built
     }
 
-    /// The steps of matching the regex against `subject`, charged before
-    /// matching, at about 80 ns a step.
-    ///
-    /// The lazy DFA scans a subject at a cost that grows with the automaton
-    /// it builds: two steps per KiB of automaton per 64 bytes of subject
-    /// (rounded up), as a match can cost up to the automaton's states times
-    /// the subject. It cannot evaluate a Unicode word boundary (`\b`, `\B`,
-    /// `\b{start}`, ...) on a non-ASCII byte, though, and then quits: a
-    /// slower engine scans the subject instead, at up to ~100 ns a byte plus
-    /// ~35 ns a byte per word-boundary assertion of the automaton, each
-    /// evaluated at every position by decoding the characters around it. A
-    /// non-ASCII subject is so charged at least 1.25 steps per byte plus
-    /// half a step per byte per assertion.
+    /// The steps of walking the lazy DFA over `subject` through states it
+    /// has built, charged before matching: two steps per KiB of automaton
+    /// per 64 bytes of subject (rounded up). Building the states, and the
+    /// slower engine, are charged as they run, see [`Scanner::is_match`].
     pub(crate) fn scan_steps(&self, subject: &str) -> u64 {
-        let len = subject.len() as u64;
-        let scan = (self.built / 1024 + 1)
-            .saturating_mul(len / 64 + 1)
-            .saturating_mul(2);
-        if self.word_looks == 0 || subject.is_ascii() {
-            return scan;
-        }
-        let per_four_bytes = self.word_looks.saturating_mul(2).saturating_add(5);
-        let slow = len.saturating_mul(per_four_bytes).div_ceil(4);
-        scan.max(slow)
+        (self.built / 1024 + 1)
+            .saturating_mul(subject.len() as u64 / 64 + 1)
+            .saturating_mul(2)
     }
 
     /// The regex, or the error `matches` reports for the pattern.
@@ -419,7 +417,9 @@ impl RegexCache {
     /// [`RuntimeOptions::with_regex_size_limit`](crate::RuntimeOptions::with_regex_size_limit)
     /// of `regex_size_limit` (zero meaning the `regex` crate's default), and
     /// pins it: every such evaluation that matches it is then charged as a
-    /// hit, whatever other evaluations add to the cache.
+    /// hit, whatever other evaluations add to the cache. A hit is charged
+    /// the lookup and the match, the first match on a thread included
+    /// building the lazy DFA states its subject needs.
     ///
     /// A pinned pattern is never evicted, and counts neither against the
     /// [capacity](RegexCacheOptions::with_capacity) nor against the
@@ -448,8 +448,9 @@ impl RegexCache {
     /// env.regex_cache().prewarm("^/api/v[0-9]+/", 1 << 20).unwrap();
     /// assert!(env.regex_cache().prewarm("(", 1 << 20).is_err());
     ///
+    /// // no compile: the match builds the few lazy DFA states it needs
     /// let mut ctx = Context::with_env(Arc::new(env));
-    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(100).with_regex_size_limit(1 << 20));
+    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(500).with_regex_size_limit(1 << 20));
     /// let program = Program::compile("'/api/v1/users'.matches('^/api/v[0-9]+/')").unwrap();
     /// assert_eq!(program.execute(&ctx), Ok(true.into()));
     /// ```
@@ -653,15 +654,16 @@ pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
             return Compiled {
                 regex: Err(format!("'{pattern}' not a valid regex:\n{err}").into()),
                 built: 0,
-                word_looks: 0,
+                scanner: None,
             }
         }
     };
+    let cache_capacity = size_limit.min(DFA_SIZE_LIMIT);
     let built = meta::Builder::new()
         .configure(
             meta::Config::new()
                 .nfa_size_limit(Some(size_limit))
-                .hybrid_cache_capacity(size_limit.min(DFA_SIZE_LIMIT))
+                .hybrid_cache_capacity(cache_capacity)
                 .match_kind(MatchKind::LeftmostFirst)
                 .utf8_empty(true),
         )
@@ -670,7 +672,7 @@ pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
         Ok(regex) => Compiled {
             built: regex.memory_usage() as u64,
             regex: Ok(Arc::new(regex)),
-            word_looks: unicode_word_looks(&hir),
+            scanner: Scanner::new(&hir, size_limit, cache_capacity).map(Arc::new),
         },
         Err(err) => {
             // as `regex::Error` reports a `meta::BuildError`
@@ -685,42 +687,10 @@ pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
             Compiled {
                 regex: Err(format!("'{pattern}' not a valid regex:\n{message}").into()),
                 built,
-                word_looks: 0,
+                scanner: None,
             }
         }
     }
-}
-
-/// How many Unicode word-boundary assertions the automaton compiled from
-/// `hir` holds: a bounded repetition holds as many copies of its body as its
-/// maximum, an unbounded one one more than its minimum.
-fn unicode_word_looks(hir: &Hir) -> u64 {
-    if !hir.properties().look_set().contains_word_unicode() {
-        return 0;
-    }
-    let mut looks = 0u64;
-    let mut walk = vec![(hir, 1u64)];
-    while let Some((hir, copies)) = walk.pop() {
-        match hir.kind() {
-            HirKind::Look(look) => {
-                if LookSet::singleton(*look).contains_word_unicode() {
-                    looks = looks.saturating_add(copies);
-                }
-            }
-            HirKind::Repetition(repetition) => {
-                let body = repetition
-                    .max
-                    .map_or(u64::from(repetition.min).saturating_add(1), u64::from);
-                walk.push((&repetition.sub, copies.saturating_mul(body)));
-            }
-            HirKind::Capture(capture) => walk.push((&capture.sub, copies)),
-            HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
-                walk.extend(hirs.iter().map(|hir| (hir, copies)));
-            }
-            HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) => {}
-        }
-    }
-    looks
 }
 
 #[cfg(test)]
@@ -1005,8 +975,8 @@ mod tests {
         assert_eq!(cache.pinned_bytes(), 0);
         cache.prewarm(r"\w{4}", 0).unwrap();
         cache.prewarm("^/api/", 1 << 20).unwrap();
-        let word = cache.get(r"\w{4}", DEFAULT).built();
-        let api = cache.get("^/api/", 1 << 20).built();
+        let word = cache.get(r"\w{4}", DEFAULT).bytes();
+        let api = cache.get("^/api/", 1 << 20).bytes();
         assert!(word > 10_000, "{word}");
         assert_eq!(cache.pinned_bytes(), (word + api) as usize);
         // a kept entry is not counted, nor pinning one again
@@ -1106,41 +1076,6 @@ mod tests {
         );
         cache.clear();
         assert_eq!(cache.state().bytes, 0);
-    }
-
-    #[test]
-    fn unicode_word_boundaries_are_counted_per_copy() {
-        let looks = |pattern: &str| compile(pattern, DEFAULT).word_looks;
-        assert_eq!(looks(r"^/api/v[0-9]+$"), 0);
-        // ASCII word boundaries leave the lazy DFA able to scan
-        assert_eq!(looks(r"(?-u:\b)x(?-u:\B)"), 0);
-        assert_eq!(looks(r"\b\w+\b"), 2);
-        assert_eq!(looks(r"\b{start}x\b{end-half}"), 2);
-        assert_eq!(looks(r"(?:\b\B|\B\b|\b\b\B|\B\B\b)"), 10);
-        assert_eq!(looks(r"(\bx\B){3}"), 6);
-        assert_eq!(looks(r"(?:\bx\B){2,}"), 6);
-        assert_eq!(looks(r"(?:\bx)*"), 1);
-        // regex-syntax keeps one copy of a repeated empty-width body
-        assert_eq!(looks(r"(\b\B){3}"), 2);
-        // an invalid pattern holds none
-        assert_eq!(looks(r"\b("), 0);
-    }
-
-    #[test]
-    fn a_non_ascii_subject_pays_for_the_slow_scan() {
-        let pattern = compile(r"(?:\b\B|\B\b|\b\b\B|\B\B\b)", DEFAULT);
-        let ascii = "a".repeat(8 << 10);
-        let mixed = "é".repeat(4 << 10);
-        // ~400 ns a byte measured: over 40,000 steps for 8 KiB
-        assert!(
-            pattern.scan_steps(&mixed) > 40_000,
-            "{}",
-            pattern.scan_steps(&mixed)
-        );
-        assert!(pattern.scan_steps(&ascii) < 1_000);
-        // a pattern without Unicode word boundaries is charged as before
-        let plain = compile(r"[a-z]+x", DEFAULT);
-        assert_eq!(plain.scan_steps(&mixed), plain.scan_steps(&ascii));
     }
 
     #[test]

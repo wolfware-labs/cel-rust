@@ -116,4 +116,6 @@ evaluations can evict a kept pattern, so size budgets for compiling every patter
 pinned with `RegexCache::prewarm`. The cache keeps at most 64 MiB of automata by default
 (`RegexCacheOptions::with_max_bytes`), plus the pinned ones (`RegexCache::pinned_bytes`), plus each kept
 regex's matching scratch space:
-up to ~2 MiB per pattern for each thread matching it, so up to 64 × threads × ~2 MiB with the defaults.
+up to ~2 MiB per pattern for each thread matching it, twice that for a pattern matched both with and without a
+budget (the budgeted match runs automata of its own, which charge each lazy DFA state as they build it), so up
+to 64 × threads × ~4 MiB with the defaults.

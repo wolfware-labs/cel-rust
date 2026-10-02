@@ -18,7 +18,7 @@ chrono-tz = { version = "0.10", default-features = false, optional = true }
 regex = { version = "1.10.5", optional = true }
 # The engine under `regex`, used directly to size compiled patterns for the
 # evaluation budget; the features are those `regex` enables itself.
-regex-automata = { version = "0.4", optional = true, default-features = false, features = ["alloc", "syntax", "meta", "nfa-pikevm"] }
+regex-automata = { version = "0.4", optional = true, default-features = false, features = ["std", "alloc", "syntax", "meta", "nfa-pikevm", "hybrid"] }
 # The parser under `regex`, used to price the translation of a pattern.
 regex-syntax = { version = "0.8", optional = true, default-features = false }
 serde = "1.0"
