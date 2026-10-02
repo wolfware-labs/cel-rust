@@ -39,9 +39,11 @@ pub use parser::{ParseError, ParseErrors};
 pub mod functions;
 mod magic;
 pub mod objects;
+#[cfg(feature = "regex")]
+mod regex_cost;
 mod resolvers;
 pub mod runtime;
-pub use runtime::{Deadline, Interrupt, RuntimeOptions};
+pub use runtime::{BudgetKind, Deadline, EvalUsage, Interrupt, RuntimeOptions};
 
 #[cfg(feature = "chrono")]
 mod duration;
@@ -212,6 +214,13 @@ pub enum ExecutionError {
     /// This error is fatal: it is never absorbed by `||`, `&&`, or optional accessors.
     #[error("iteration budget of {limit} exceeded")]
     IterationBudgetExceeded { limit: u64 },
+    /// The evaluation ran out of the steps or bytes budget set with
+    /// [`RuntimeOptions::with_max_steps`] or [`RuntimeOptions::with_max_bytes`].
+    ///
+    /// This error is fatal: it is never absorbed by `||`, `&&`, comprehension
+    /// macros or optional accessors.
+    #[error("{kind} budget of {limit} exceeded")]
+    BudgetExceeded { kind: BudgetKind, limit: u64 },
 }
 
 impl ExecutionError {
@@ -286,7 +295,9 @@ impl ExecutionError {
     pub(crate) fn is_fatal(&self) -> bool {
         matches!(
             self,
-            ExecutionError::Interrupted | ExecutionError::IterationBudgetExceeded { .. }
+            ExecutionError::Interrupted
+                | ExecutionError::IterationBudgetExceeded { .. }
+                | ExecutionError::BudgetExceeded { .. }
         )
     }
 
@@ -425,6 +436,12 @@ impl Program {
 
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
+    }
+
+    /// Executes the program like [`execute`](Self::execute), and reports the
+    /// resources the evaluation used.
+    pub fn execute_with_usage(&self, context: &Context) -> (ResolveResult, EvalUsage) {
+        Value::resolve_with_usage(&self.expression, context)
     }
 
     /// Returns the variables and functions referenced by the CEL program

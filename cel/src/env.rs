@@ -1,5 +1,5 @@
 use crate::common::{
-    decls::FunctionDecl,
+    decls::{Builtin, FunctionDecl, OverloadDecl},
     functions::Function,
     types::{self, Type},
     value::CowVal,
@@ -198,11 +198,20 @@ impl Env {
         &self,
         name: &str,
         args: &[CowVal<'_, '_>],
-    ) -> Option<Function> {
-        match self.functions.get(name) {
-            None => None,
-            Some(fn_decl) => fn_decl.find_overload(true, args),
-        }
+    ) -> Option<&OverloadDecl> {
+        self.functions
+            .get(name)
+            .and_then(|fn_decl| fn_decl.find_overload_decl(true, args))
+    }
+
+    /// Marks the member overload `name`/`id` as the standard library's
+    /// `builtin`, see [`OverloadDecl::builtin`].
+    #[cfg_attr(not(feature = "regex"), allow(dead_code))]
+    pub(crate) fn mark_builtin(&mut self, name: &str, id: &str, builtin: Builtin) {
+        self.functions
+            .get_mut(name)
+            .expect("the builtin function is declared")
+            .mark_builtin(id, builtin);
     }
 
     pub(crate) fn has_member_overload(&self, name: &str) -> bool {

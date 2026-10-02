@@ -401,7 +401,14 @@ pub(crate) fn stdlib(env: &mut crate::Env) {
         id = "string_size");
     crate::add_member_overload!(env, fn starts_with: (String, String) -> CelBool);
     #[cfg(feature = "regex")]
-    crate::add_member_overload!(env, fn matches: (String, String) -> Result<CelBool>);
+    {
+        crate::add_member_overload!(env, fn matches: (String, String) -> Result<CelBool>);
+        env.mark_builtin(
+            "matches",
+            "string.matches(string)",
+            crate::common::decls::Builtin::StringMatches,
+        );
+    }
 }
 
 #[cfg(test)]

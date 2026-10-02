@@ -43,6 +43,16 @@ impl<'v> Struct<'v> {
         self.entries.insert(name, Arc::from(value.into_owned()));
     }
 
+    /// The number of fields set on the struct.
+    pub(crate) fn field_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The values of the fields set on the struct.
+    pub(crate) fn fields(&self) -> impl Iterator<Item = &(dyn Val + 'v)> {
+        self.entries.values().map(Deref::deref)
+    }
+
     /// Returns a map of all field values in the struct.
     pub fn field_values(&self) -> BTreeMap<String, Arc<dyn Val + 'v>> {
         self.entries.clone()

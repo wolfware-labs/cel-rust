@@ -174,3 +174,36 @@ fn shared_string_variable_is_not_copied_into_a_function() {
         assert_below(bytes, 4 * KIB);
     });
 }
+
+/// `map` and `filter` preallocate their result for the whole input. Under a
+/// budget that preallocation is capped by what the budget can still pay for:
+/// a budget exceeded after a few elements must not have reserved room for a
+/// million of them.
+#[test]
+fn map_preallocation_is_bounded_by_the_budget() {
+    use cel::RuntimeOptions;
+    profiled(|| {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("l", (0..1_000_000i64).collect::<Vec<_>>());
+        for (options, src) in [
+            (
+                RuntimeOptions::default().with_max_steps(1_000),
+                "size(l.map(x, x))",
+            ),
+            (
+                RuntimeOptions::default().with_max_bytes(4 * KIB),
+                "size(l.map(x, x))",
+            ),
+            (
+                RuntimeOptions::default().with_max_steps(1_000),
+                "size(l.filter(x, true))",
+            ),
+        ] {
+            ctx.set_budget(options);
+            let program = Program::compile(src).unwrap();
+            let (result, bytes) = bytes_allocated(|| program.execute(&ctx));
+            assert!(result.is_err(), "{src}: {result:?}");
+            assert_below(bytes, 256 * KIB);
+        }
+    });
+}

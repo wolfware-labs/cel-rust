@@ -16,6 +16,22 @@ use std::ops::Deref;
 /// bound (`dyn Val + 'v`). Built-in scalars are `'static`; [`CelString`],
 /// [`CelBytes`], and the containers can borrow.
 ///
+/// # Cost under an evaluation budget
+///
+/// The steps and bytes budgets (see
+/// [`RuntimeOptions`](crate::RuntimeOptions)) price the built-in values by
+/// their contents. A custom `Val` is opaque to them:
+///
+/// - a copy made through [`clone_as_boxed`](Val::clone_as_boxed) is charged
+///   no bytes, whatever the implementation allocates;
+/// - comparing it (`==`, `!=`, `in`, ordering, a map lookup) is charged no
+///   steps beyond the node's, whatever [`equals`](Val::equals) or its
+///   [`Comparer`] does.
+///
+/// Keep both cheap: share large contents behind an `Arc`, as the built-in
+/// strings, lists and maps do, so that a clone is O(1), and make comparisons
+/// O(1) or bounded by data the embedder controls.
+///
 /// # Implementing `Val` for a `'static` type
 ///
 /// Return `Some(self)` from [`Val::as_any`] and implement the [`StaticVal`]
@@ -172,6 +188,9 @@ pub trait Val: Debug + Send + Sync {
     /// Clones the value into a box whose trait-object lifetime `'v` is any
     /// lifetime `Self` outlives. Implementations must not shorten a borrow:
     /// a value borrowing for `'a` clones into a value borrowing for `'a`.
+    ///
+    /// Copies are charged no bytes against an evaluation budget: keep this
+    /// O(1) (see [the trait docs](Val#cost-under-an-evaluation-budget)).
     fn clone_as_boxed<'v>(&self) -> Box<dyn Val + 'v>
     where
         Self: 'v;

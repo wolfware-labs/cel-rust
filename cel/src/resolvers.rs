@@ -29,6 +29,7 @@ impl Resolver for AllArguments {
     fn resolve(&self, ctx: &FunctionContext) -> ResolveResult {
         let mut args = Vec::with_capacity(ctx.args.len());
         for arg in ctx.args.iter() {
+            crate::magic::charge_conversion(ctx, arg.as_ref())?;
             args.push(Value::try_from(arg.as_ref())?);
         }
         Ok(Value::List(args.into()))

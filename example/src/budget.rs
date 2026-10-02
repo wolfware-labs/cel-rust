@@ -8,11 +8,12 @@
 //! The budget is *runtime policy*, so it is configured on the [`Env`] through
 //! [`RuntimeOptions`], and it counts comprehension iterations (`all`, `exists`,
 //! `map`, `filter`, ...): one per element visited, nested comprehensions
-//! included. Everything else an expression does is free. When an evaluation
-//! goes over, it fails with [`ExecutionError::IterationBudgetExceeded`].
+//! included. When an evaluation goes over, it fails with
+//! [`ExecutionError::IterationBudgetExceeded`]. Steps and bytes budgets
+//! (sections 8 and 9) bound the rest of what an expression does.
 //!
 //! Run with `cargo run -p example --bin example-budget`.
-use cel::{Context, Env, ExecutionError, Program, ResolveResult, RuntimeOptions};
+use cel::{BudgetKind, Context, Env, ExecutionError, Program, ResolveResult, RuntimeOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -151,5 +152,56 @@ fn main() {
     assert_eq!(
         run(&mut context, "list.all(x, x > 0)", 2_001),
         exceeded(2_000)
+    );
+
+    // 8. Steps and bytes budgets bound everything else.
+    //
+    // Iterations are one way to run long. A steps budget counts every node
+    // evaluated and every function called (plus the elements walked by `in`,
+    // list equality and string searches), and a bytes budget counts what the
+    // values created allocate: together they bound any expression.
+    let options = RuntimeOptions::default()
+        .with_max_steps(1_000)
+        .with_max_bytes(64 * 1024);
+    let mut env = Env::stdlib();
+    env.set_options(options);
+    let mut context = Context::with_env(Arc::new(env));
+    let result = run(&mut context, "list.all(x, list.all(y, y > 0))", 1_000);
+    assert_eq!(
+        result,
+        Err(ExecutionError::BudgetExceeded {
+            kind: BudgetKind::Steps,
+            limit: 1_000
+        })
+    );
+    println!(
+        "steps: nested all over 1000 elements -> {}",
+        result.unwrap_err()
+    );
+
+    // 9. Budgets can be set per context, and usage reported per evaluation.
+    //
+    // `Context::set_budget` replaces the `Env`'s options for the evaluations
+    // run with that context, so contexts sharing one `Env` can be bounded
+    // differently. `execute_with_usage` reports what an evaluation used, budget
+    // or not.
+    let env = Arc::new(Env::stdlib());
+    let mut tight = Context::with_env(env.clone());
+    tight.set_budget(RuntimeOptions::default().with_max_bytes(16));
+    let concat = Program::compile("'0123456789' + '0123456789'").unwrap();
+    let result = concat.execute(&tight);
+    assert!(matches!(
+        result,
+        Err(ExecutionError::BudgetExceeded {
+            kind: BudgetKind::Bytes,
+            ..
+        })
+    ));
+    let (value, usage) = concat.execute_with_usage(&Context::with_env(env));
+    assert!(value.is_ok());
+    assert_eq!(usage.bytes, 20);
+    println!(
+        "per context: 20 bytes over a 16 byte budget -> {}; usage {usage:?}",
+        result.unwrap_err()
     );
 }

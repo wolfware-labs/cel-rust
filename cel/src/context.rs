@@ -2,7 +2,7 @@ use crate::common::value::{CowVal, Val};
 use crate::magic::{Function, FunctionRegistry, IntoFunction};
 use crate::objects::{TryIntoValue, Value};
 use crate::parser::Expression;
-use crate::runtime::{Frame, Interrupt};
+use crate::runtime::{Frame, Interrupt, RuntimeOptions};
 use crate::{DeclarationError, Env, ExecutionError};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -55,6 +55,7 @@ pub enum Context<'p, 'v> {
         variables: BTreeMap<String, Box<dyn Val + 'v>>,
         resolver: Option<&'v dyn VariableResolver>,
         interrupt: Option<&'v dyn Interrupt>,
+        budget: Option<RuntimeOptions>,
         env: Arc<Env>,
     },
     #[non_exhaustive]
@@ -63,9 +64,22 @@ pub enum Context<'p, 'v> {
         variables: BTreeMap<String, Box<dyn Val + 'v>>,
         resolver: Option<&'v dyn VariableResolver>,
         interrupt: Option<&'v dyn Interrupt>,
-        frame: Option<Frame<'v>>,
+        budget: Option<RuntimeOptions>,
+        /// The frame of the evaluation this scope takes part in, copied into
+        /// every inner scope so that looking it up is O(1).
+        frame: Option<&'p Frame<'v>>,
     },
 }
+
+// A root context is shared by reference across threads evaluating programs
+// (one per program, many workers), and the frame of an evaluation is
+// reachable from every scope: both must stay `Send + Sync`. Checked at
+// compile time, so a non-thread-safe field fails the build, not a test.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Context<'static, 'static>>();
+    assert_send_sync::<Frame<'static>>();
+};
 
 impl<'p, 'v> Context<'p, 'v> {
     pub fn add_variable<S, V>(
@@ -181,6 +195,88 @@ impl<'p, 'v> Context<'p, 'v> {
         }
     }
 
+    /// Sets the [`RuntimeOptions`] (budgets and interrupt poll frequency) of
+    /// the evaluations performed with this context or a scope derived from it.
+    ///
+    /// The options are laid over those of the parent scopes and of the
+    /// [`Env`]: every field left unset (zero, the default) is inherited, so a
+    /// context can add a steps budget and keep the `Env`'s iteration budget.
+    /// An inherited budget cannot be lifted by setting zero; set a larger
+    /// limit instead.
+    ///
+    /// A limit set here replaces the inherited one, whether it is lower or
+    /// higher: a context can **loosen** an `Env` limit as well as tighten it.
+    /// The options are laid over the `Env`'s, not combined with the minimum.
+    /// Whoever can call `set_budget` on a context therefore controls its
+    /// evaluations' limits; the `Env` sets the defaults, not a ceiling. [`budget`](Self::budget) returns the options in force.
+    /// One `Env` can thus be shared by contexts that each bound their
+    /// evaluations differently.
+    ///
+    /// The options are read once, when an evaluation starts. Setting them on
+    /// a scope derived from a context that is being evaluated (say, in a
+    /// custom function evaluating a nested program through
+    /// [`FunctionContext::ptx`](crate::FunctionContext::ptx)) has no effect on
+    /// that evaluation: the nested program shares the running evaluation's
+    /// frame, and with it the budget the evaluation started with.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{BudgetKind, Context, Env, ExecutionError, Program, RuntimeOptions};
+    /// use std::sync::Arc;
+    ///
+    /// let env = Arc::new(Env::stdlib());
+    /// let program = Program::compile("'abc' + 'def'").unwrap();
+    ///
+    /// let mut tight = Context::with_env(env.clone());
+    /// tight.set_budget(RuntimeOptions::default().with_max_bytes(4));
+    /// assert_eq!(
+    ///     program.execute(&tight),
+    ///     Err(ExecutionError::BudgetExceeded { kind: BudgetKind::Bytes, limit: 4 })
+    /// );
+    ///
+    /// let loose = Context::with_env(env);
+    /// assert_eq!(program.execute(&loose), Ok("abcdef".into()));
+    /// ```
+    pub fn set_budget(&mut self, options: RuntimeOptions) {
+        match self {
+            Context::Root { budget, .. } | Context::Child { budget, .. } => {
+                *budget = Some(options);
+            }
+        }
+    }
+
+    /// The [`RuntimeOptions`] in force for an evaluation started with this
+    /// context: those set with [`set_budget`](Self::set_budget) on this
+    /// scope, laid over those of its parent scopes, laid over the [`Env`]'s.
+    /// A field a scope leaves unset (zero) is inherited.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{Context, Env, RuntimeOptions};
+    /// use std::sync::Arc;
+    ///
+    /// let mut env = Env::stdlib();
+    /// env.set_options(RuntimeOptions::default().with_max_iterations(1_000));
+    /// let mut ctx = Context::with_env(Arc::new(env));
+    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(10_000));
+    ///
+    /// let budget = ctx.budget();
+    /// assert_eq!(budget.max_steps(), 10_000);
+    /// assert_eq!(budget.max_iterations(), 1_000);
+    /// ```
+    pub fn budget(&self) -> RuntimeOptions {
+        match self {
+            Context::Root { budget, env, .. } => match budget {
+                Some(budget) => budget.over(env.options()),
+                None => env.options().clone(),
+            },
+            Context::Child { budget, parent, .. } => match budget {
+                Some(budget) => budget.over(&parent.budget()),
+                None => parent.budget(),
+            },
+        }
+    }
+
     /// The nearest [`Interrupt`] handle set on this context or one of its parents.
     fn interrupt(&self) -> Option<&'v dyn Interrupt> {
         match self {
@@ -192,24 +288,60 @@ impl<'p, 'v> Context<'p, 'v> {
     }
 
     /// The [`Frame`] of the evaluation this context takes part in, if any.
-    pub(crate) fn frame(&self) -> Option<&Frame<'v>> {
+    ///
+    /// This is O(1): every scope holds the frame reference itself.
+    #[inline(always)]
+    pub(crate) fn frame(&self) -> Option<&'p Frame<'v>> {
         match self {
             Context::Root { .. } => None,
-            Context::Child { frame, parent, .. } => frame.as_ref().or_else(|| parent.frame()),
+            Context::Child { frame, .. } => *frame,
         }
     }
 
-    /// Creates an inner scope carrying a fresh [`Frame`] for a new evaluation.
+    /// Creates a [`Frame`] for a new evaluation under this context, from the
+    /// limits and interrupt handle in force here, or `None` when there is
+    /// nothing to enforce: no budget and no interrupt handle.
+    pub(crate) fn new_frame(&self) -> Option<Frame<'v>> {
+        let interrupt = self.interrupt();
+        // the common case, checked without merging any options
+        if interrupt.is_none() && !self.sets_budget() && self.env().options().is_unbounded() {
+            return None;
+        }
+        let options = self.budget();
+        if interrupt.is_none() && options.is_unbounded() {
+            return None;
+        }
+        Some(Frame::new(&options, interrupt))
+    }
+
+    /// Whether this scope or one of its parents has options set with
+    /// [`set_budget`](Self::set_budget).
+    fn sets_budget(&self) -> bool {
+        match self {
+            Context::Root { budget, .. } => budget.is_some(),
+            Context::Child { budget, parent, .. } => budget.is_some() || parent.sets_budget(),
+        }
+    }
+
+    /// Creates a [`Frame`] for a new evaluation under this context even when
+    /// there is nothing to enforce, to count the resources it uses.
+    pub(crate) fn new_counting_frame(&self) -> Frame<'v> {
+        Frame::new(&self.budget(), self.interrupt())
+    }
+
+    /// Creates an inner scope evaluating within `frame`, which the caller owns
+    /// (typically on its stack) for the duration of the evaluation.
     ///
     /// Callers must check [`frame`](Self::frame) first: a nested evaluation must
     /// share the frame of the evaluation it runs within, not start its own.
-    pub(crate) fn new_frame_scope<'b>(&'b self) -> Context<'b, 'v> {
+    pub(crate) fn new_frame_scope<'b>(&'b self, frame: &'b Frame<'v>) -> Context<'b, 'v> {
         Context::Child {
             parent: self,
             variables: Default::default(),
             resolver: None,
             interrupt: None,
-            frame: Some(Frame::new(self.env().options(), self.interrupt())),
+            budget: None,
+            frame: Some(frame),
         }
     }
 
@@ -331,7 +463,8 @@ impl<'p, 'v> Context<'p, 'v> {
             variables: Default::default(),
             resolver: None,
             interrupt: None,
-            frame: None,
+            budget: None,
+            frame: self.frame(),
         }
     }
 
@@ -353,6 +486,7 @@ impl<'p, 'v> Context<'p, 'v> {
             functions: Default::default(),
             resolver: None,
             interrupt: None,
+            budget: None,
         }
     }
 
@@ -363,6 +497,7 @@ impl<'p, 'v> Context<'p, 'v> {
             functions: Default::default(),
             resolver: None,
             interrupt: None,
+            budget: None,
         }
     }
 }
@@ -375,6 +510,7 @@ impl Default for Context<'_, '_> {
             functions: Default::default(),
             resolver: None,
             interrupt: None,
+            budget: None,
         }
     }
 }

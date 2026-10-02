@@ -1,10 +1,13 @@
 use crate::common::ast::{operators, ComprehensionExpr, EntryExpr, Expr};
+#[cfg(feature = "regex")]
+use crate::common::decls::Builtin;
 use crate::common::types::bool::Bool;
 use crate::common::types::map;
 use crate::common::types::optional::{unwrap_optional, Unwrapped};
 use crate::common::types::*;
 use crate::common::value::{BuiltinRef, CowVal, FromVal, StaticVal, Val};
 use crate::context::Context;
+use crate::runtime::{compare_size, Frame};
 use crate::{ExecutionError, Expression, FunctionContext};
 #[cfg(feature = "chrono")]
 use chrono::TimeZone;
@@ -1019,14 +1022,47 @@ impl Value {
         Self::with_frame(ctx, |ctx| {
             let mut res = Vec::with_capacity(expr.len());
             for expr in expr {
-                res.push(Self::resolve_val(expr, ctx)?.as_ref().try_into()?);
+                let value = Self::resolve_val(expr, ctx)?;
+                charge_conversion(ctx.frame(), value.as_ref())?;
+                res.push(value.as_ref().try_into()?);
             }
             Ok(Value::List(res.into()))
         })
     }
 
     pub fn resolve(expr: &Expression, ctx: &Context) -> ResolveResult {
-        Self::with_frame(ctx, |ctx| Self::resolve_val(expr, ctx)?.as_ref().try_into())
+        Self::with_frame(ctx, |ctx| Self::resolve_to_value(expr, ctx))
+    }
+
+    /// Evaluates `expr` within the frame `ctx` carries, if any, and converts
+    /// the result into a [`Value`], charging the conversion.
+    fn resolve_to_value(expr: &Expression, ctx: &Context) -> ResolveResult {
+        let value = Self::resolve_val(expr, ctx)?;
+        charge_conversion(ctx.frame(), value.as_ref())?;
+        value.as_ref().try_into()
+    }
+
+    /// Evaluates `expr` like [`resolve`](Self::resolve), and reports the
+    /// resources the evaluation used.
+    pub fn resolve_with_usage(
+        expr: &Expression,
+        ctx: &Context,
+    ) -> (ResolveResult, crate::EvalUsage) {
+        match ctx.frame() {
+            // a nested evaluation: report what it added to the shared frame
+            Some(frame) => {
+                let before = frame.usage();
+                let result = Self::resolve_to_value(expr, ctx);
+                (result, frame.usage().since(&before))
+            }
+            // count even when nothing is enforced
+            None => {
+                let frame = ctx.new_counting_frame();
+                let result =
+                    frame.finish(Self::resolve_to_value(expr, &ctx.new_frame_scope(&frame)));
+                (result, frame.usage())
+            }
+        }
     }
 
     /// Runs `f` within the evaluation frame of `ctx`, creating one if this is
@@ -1043,11 +1079,14 @@ impl Value {
         if ctx.frame().is_some() {
             return f(ctx);
         }
-        let ctx = ctx.new_frame_scope();
-        let result = f(&ctx);
-        ctx.frame()
-            .expect("frame scope carries a frame")
-            .finish(result)
+        match ctx.new_frame() {
+            // nothing to enforce: no frame, and no per-node work beyond a check
+            None => f(ctx),
+            Some(frame) => {
+                let result = f(&ctx.new_frame_scope(&frame));
+                frame.finish(result)
+            }
+        }
     }
 
     /// Evaluates `expr` against `ctx`.
@@ -1067,6 +1106,11 @@ impl Value {
         expr: &'e Expression,
         ctx: &'e Context<'p, 'v>,
     ) -> Result<CowVal<'e, 'v>, ExecutionError> {
+        if let Some(frame) = ctx.frame() {
+            if !frame.step() {
+                return Err(frame.exceeded());
+            }
+        }
         match &expr.expr {
             Expr::Literal(literal) => Ok(literal.to_val()),
             Expr::Call(call) => {
@@ -1126,16 +1170,16 @@ impl Value {
                             };
                         }
                         operators::EQUALS => {
-                            return Ok(bool(
-                                Value::resolve_val(&call.args[0], ctx)?
-                                    == Value::resolve_val(&call.args[1], ctx)?,
-                            ))
+                            let lhs = Value::resolve_val(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
+                            return Ok(bool(lhs == rhs));
                         }
                         operators::NOT_EQUALS => {
-                            return Ok(bool(
-                                Value::resolve_val(&call.args[0], ctx)?
-                                    != Value::resolve_val(&call.args[1], ctx)?,
-                            ))
+                            let lhs = Value::resolve_val(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
+                            return Ok(bool(lhs != rhs));
                         }
                         operators::INDEX | operators::OPT_INDEX => {
                             let mut is_optional = call.func_name == operators::OPT_INDEX;
@@ -1151,6 +1195,7 @@ impl Value {
                             };
 
                             let index = Self::resolve_val(&call.args[1], ctx)?;
+                            charge_lookup(ctx, index.as_ref(), value.as_ref())?;
                             let overload_error = ExecutionError::overload_for_values(
                                 &call.func_name,
                                 [value.as_ref(), index.as_ref()],
@@ -1171,7 +1216,7 @@ impl Value {
                             };
                             return if is_optional {
                                 Ok(CowVal::owned(match result {
-                                    Ok(val) => CelOptional::of(val.into_owned()),
+                                    Ok(val) => CelOptional::of(owned(ctx.frame(), val)?),
                                     Err(e) if e.is_fatal() => return Err(e),
                                     Err(_) => CelOptional::none(),
                                 }))
@@ -1205,7 +1250,7 @@ impl Value {
                             let result = match index_into(target, field, "_?._", |value| {
                                 ExecutionError::overload_for_values("_?._", [value, field], false)
                             }) {
-                                Ok(v) => CelOptional::of(v.into_owned()),
+                                Ok(v) => CelOptional::of(owned(ctx.frame(), v)?),
                                 Err(e) if e.is_fatal() => return Err(e),
                                 Err(_) => CelOptional::none(),
                             };
@@ -1217,7 +1262,8 @@ impl Value {
                         operators::ADD => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
-                            return Ok(CowVal::Owned(
+                            return Ok(CowVal::Owned(owned_fresh(
+                                ctx.frame(),
                                 lhs.as_adder()
                                     .ok_or_else(|| {
                                         ExecutionError::unsupported_binary_operator(
@@ -1226,14 +1272,14 @@ impl Value {
                                             rhs.as_ref(),
                                         )
                                     })?
-                                    .add(rhs.as_ref())?
-                                    .into_owned(),
-                            ));
+                                    .add(rhs.as_ref())?,
+                            )?));
                         }
                         operators::SUBSTRACT => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
-                            return Ok(CowVal::Owned(
+                            return Ok(CowVal::Owned(owned_fresh(
+                                ctx.frame(),
                                 lhs.as_subtractor()
                                     .ok_or_else(|| {
                                         ExecutionError::unsupported_binary_operator(
@@ -1242,14 +1288,14 @@ impl Value {
                                             rhs.as_ref(),
                                         )
                                     })?
-                                    .sub(rhs.as_ref())?
-                                    .into_owned(),
-                            ));
+                                    .sub(rhs.as_ref())?,
+                            )?));
                         }
                         operators::DIVIDE => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
-                            return Ok(CowVal::Owned(
+                            return Ok(CowVal::Owned(owned_fresh(
+                                ctx.frame(),
                                 lhs.as_divider()
                                     .ok_or_else(|| {
                                         ExecutionError::unsupported_binary_operator(
@@ -1258,14 +1304,14 @@ impl Value {
                                             rhs.as_ref(),
                                         )
                                     })?
-                                    .div(rhs.as_ref())?
-                                    .into_owned(),
-                            ));
+                                    .div(rhs.as_ref())?,
+                            )?));
                         }
                         operators::MULTIPLY => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
-                            return Ok(CowVal::Owned(
+                            return Ok(CowVal::Owned(owned_fresh(
+                                ctx.frame(),
                                 lhs.as_multiplier()
                                     .ok_or_else(|| {
                                         ExecutionError::unsupported_binary_operator(
@@ -1274,14 +1320,14 @@ impl Value {
                                             rhs.as_ref(),
                                         )
                                     })?
-                                    .mul(rhs.as_ref())?
-                                    .into_owned(),
-                            ));
+                                    .mul(rhs.as_ref())?,
+                            )?));
                         }
                         operators::MODULO => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
-                            return Ok(CowVal::Owned(
+                            return Ok(CowVal::Owned(owned_fresh(
+                                ctx.frame(),
                                 lhs.as_modder()
                                     .ok_or_else(|| {
                                         ExecutionError::unsupported_binary_operator(
@@ -1290,13 +1336,13 @@ impl Value {
                                             rhs.as_ref(),
                                         )
                                     })?
-                                    .modulo(rhs.as_ref())?
-                                    .into_owned(),
-                            ));
+                                    .modulo(rhs.as_ref())?,
+                            )?));
                         }
                         operators::LESS => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     == Ordering::Less,
@@ -1305,6 +1351,7 @@ impl Value {
                         operators::LESS_EQUALS => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     != Ordering::Greater,
@@ -1313,6 +1360,7 @@ impl Value {
                         operators::GREATER => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     == Ordering::Greater,
@@ -1321,6 +1369,7 @@ impl Value {
                         operators::GREATER_EQUALS => {
                             let lhs = Value::resolve_val(&call.args[0], ctx)?;
                             let rhs = Value::resolve_val(&call.args[1], ctx)?;
+                            charge_equality(ctx, lhs.as_ref(), rhs.as_ref())?;
                             return Ok(bool(
                                 compare_values(&call.func_name, lhs.as_ref(), rhs.as_ref())?
                                     != Ordering::Less,
@@ -1336,6 +1385,7 @@ impl Value {
                                     false,
                                 )
                             };
+                            charge_membership(ctx, lhs.as_ref(), rhs.as_ref())?;
                             let container = rhs.as_container().ok_or_else(overload_error)?;
                             return container
                                 .contains(lhs.as_ref())
@@ -1411,8 +1461,20 @@ impl Value {
                         }
                         let target = Value::resolve_val(target_expr, ctx)?;
                         args.insert(0, target);
-                        if let Some(op) = ctx.env().find_member_overload(&call.func_name, &args) {
-                            return op(args);
+                        charge_dispatch(ctx, &call.func_name, &args)?;
+                        if let Some(overload) =
+                            ctx.env().find_member_overload(&call.func_name, &args)
+                        {
+                            // Under a budget, the standard library's
+                            // `string.matches` is run by the interpreter, which
+                            // can charge the compiled regex; nothing else is.
+                            #[cfg(feature = "regex")]
+                            if let (Some(frame), Some(Builtin::StringMatches)) =
+                                (ctx.frame(), overload.builtin())
+                            {
+                                return budgeted_matches(frame, &args);
+                            }
+                            return charge_fresh(ctx.frame(), (overload.op())(args)?);
                         }
                         let func = match ctx.get_function(&call.func_name) {
                             Some(func) => func,
@@ -1431,9 +1493,10 @@ impl Value {
                             }
                         };
                         let target = args.remove(0);
+                        let frame = ctx.frame();
                         let mut ctx =
                             FunctionContext::new(&call.func_name, Some(target), ctx, args);
-                        (func)(&mut ctx)
+                        charge_fresh(frame, (func)(&mut ctx)?)
                     }
                 }
             }
@@ -1454,14 +1517,14 @@ impl Value {
                 };
                 let Some(name) = name else {
                     let left = Value::resolve_val(select.operand.deref(), ctx)?;
-                    return select_field(left, &select.field, select.test);
+                    return select_field(ctx.frame(), left, &select.field, select.test);
                 };
                 let (mut value, fields) = resolve_qualified_name(ctx, &name)?;
                 for field in fields {
-                    value = select_field(value, field, false)?;
+                    value = select_field(ctx.frame(), value, field, false)?;
                 }
                 if select.test {
-                    select_field(value, &select.field, true)
+                    select_field(ctx.frame(), value, &select.field, true)
                 } else {
                     Ok(value)
                 }
@@ -1473,15 +1536,15 @@ impl Value {
                     if list_expr.optional_indices.contains(&idx) {
                         match unwrap_optional(value) {
                             Unwrapped::NotOptional(v) | Unwrapped::Some(v) => {
-                                list.push(v.into_owned())
+                                list.push(owned(ctx.frame(), v)?)
                             }
                             Unwrapped::None => {}
                         }
                     } else {
-                        list.push(value.into_owned());
+                        list.push(owned(ctx.frame(), value)?);
                     }
                 }
-                Ok(CowVal::owned(CelList::from(list)))
+                charge_fresh(ctx.frame(), CowVal::owned(CelList::from(list)))
             }
             Expr::Map(map_expr) => {
                 let mut map: HashMap<CelMapKey<'v>, Box<dyn Val + 'v>> =
@@ -1506,12 +1569,12 @@ impl Value {
 
                     if let Some(value) = value {
                         if ctx.env().error_on_duplicate_map_keys() && map::has_key(&map, &key) {
-                            return Err(ExecutionError::DuplicateKey(Key::from(key).into()));
+                            return Err(ExecutionError::DuplicateKey(duplicate_key(key)));
                         }
-                        map.insert(key, value.into_owned());
+                        map.insert(key, owned(ctx.frame(), value)?);
                     }
                 }
-                Ok(CowVal::owned(CelMap::from(map)))
+                charge_fresh(ctx.frame(), CowVal::owned(CelMap::from(map)))
             }
             Expr::Comprehension(comprehension) => {
                 let accu_init = Value::resolve_val(&comprehension.accu_init, ctx)?;
@@ -1535,7 +1598,7 @@ impl Value {
 
                 let frame = ctx.frame();
                 let mut ctx = ctx.new_inner_scope();
-                ctx.add_variable_as_val(&comprehension.accu_var, accu_init.into_owned());
+                ctx.add_variable_as_val(&comprehension.accu_var, owned(frame, accu_init)?);
 
                 let mut items = iter
                     .as_iterable()
@@ -1551,13 +1614,14 @@ impl Value {
                     if !try_bool(Value::resolve_val(&comprehension.loop_cond, &ctx))? {
                         break;
                     }
-                    ctx.add_variable_as_val(&comprehension.iter_var, item.clone_as_boxed());
+                    ctx.add_variable_as_val(&comprehension.iter_var, owned_item(frame, item)?);
                     let accu = Value::resolve_val(&comprehension.loop_step, &ctx)?;
-                    ctx.add_variable_as_val(&comprehension.accu_var, accu.into_owned());
+                    ctx.add_variable_as_val(&comprehension.accu_var, owned(frame, accu)?);
                 }
-                Ok(CowVal::Owned(
-                    Value::resolve_val(&comprehension.result, &ctx)?.into_owned(),
-                ))
+                Ok(CowVal::Owned(owned(
+                    frame,
+                    Value::resolve_val(&comprehension.result, &ctx)?,
+                )?))
             }
             Expr::Struct(strct) => {
                 let name = strct.type_name.clone();
@@ -1589,12 +1653,26 @@ impl Value {
                             }
                         }
                     }
-                    Ok(CowVal::Owned(struct_type.new_value(fields)?))
+                    charge_fresh(ctx.frame(), CowVal::Owned(struct_type.new_value(fields)?))
                 }
             }
             Expr::Unspecified => panic!("Can't evaluate Unspecified Expr"),
         }
     }
+}
+
+/// The key a [`ExecutionError::DuplicateKey`] reports: a string key longer
+/// than 64 characters is cut to its first 64 and an ellipsis, so the error,
+/// built outside any budget, never copies a large key.
+fn duplicate_key(key: CelMapKey) -> Value {
+    const SHOWN: usize = 64;
+    if let Some(s) = key.inner().downcast_ref::<CelString>() {
+        let s = s.inner();
+        if let Some((cut, _)) = s.char_indices().nth(SHOWN) {
+            return Value::String(Arc::new(format!("{}…", &s[..cut])));
+        }
+    }
+    Key::from(key).into()
 }
 
 /// A boolean result, borrowed from a constant: no allocation.
@@ -1693,6 +1771,13 @@ impl<'e> AppendStep<'e> {
             .as_sizer()
             .map(|s| *s.size().inner() as usize)
             .unwrap_or(0);
+        let frame = ctx.frame();
+        // Under a budget, reserve no more than the budget can pay for: every
+        // element costs at least a step and a list slot.
+        let size_hint = match frame {
+            Some(frame) => size_hint.min(frame.elements_left()),
+            None => size_hint,
+        };
         let mut accu = MutableList::with_capacity(size_hint);
 
         let mut ctx = ctx.new_inner_scope();
@@ -1704,10 +1789,13 @@ impl<'e> AppendStep<'e> {
             })?
             .iter();
         while let Some(item) = items.next() {
+            if let Some(frame) = frame {
+                frame.tick()?;
+            }
             if !try_bool(Value::resolve_val(&comprehension.loop_cond, &ctx))? {
                 break;
             }
-            ctx.add_variable_as_val(&comprehension.iter_var, item.clone_as_boxed());
+            ctx.add_variable_as_val(&comprehension.iter_var, owned_item(frame, item)?);
             if let Some(guard) = self.guard {
                 if !try_bool(Value::resolve_val(guard, &ctx))? {
                     continue;
@@ -1742,8 +1830,9 @@ fn call_function<'e, 'p, 'v>(
     ftx_name: &'e str,
     args: Vec<CowVal<'e, 'v>>,
 ) -> Result<CowVal<'e, 'v>, ExecutionError> {
+    charge_dispatch(ctx, ftx_name, &args)?;
     if let Some(op) = ctx.env().find_overload(name, &args) {
-        return op(args);
+        return charge_fresh(ctx.frame(), op(args)?);
     }
     let func = match ctx.get_function(name) {
         Some(func) => func,
@@ -1758,8 +1847,201 @@ fn call_function<'e, 'p, 'v>(
             return Err(ExecutionError::UndeclaredReference(name.to_owned().into()));
         }
     };
+    let frame = ctx.frame();
     let mut ctx = FunctionContext::new(ftx_name, None, ctx, args);
-    (func)(&mut ctx)
+    charge_fresh(frame, (func)(&mut ctx)?)
+}
+
+/// Takes ownership of `value`, charging the bytes of the copy when it is
+/// borrowed (see [`clone_size`](crate::runtime::clone_size)).
+#[inline(always)]
+fn owned<'v>(
+    frame: Option<&Frame<'_>>,
+    value: CowVal<'_, 'v>,
+) -> Result<Box<dyn Val + 'v>, ExecutionError> {
+    if let (Some(frame), CowVal::Borrowed(v)) = (frame, &value) {
+        if !frame.add_clone(*v) {
+            return Err(frame.exceeded());
+        }
+    }
+    Ok(value.into_owned())
+}
+
+/// Copies an element handed out by an iterator, charging the copy.
+#[inline(always)]
+fn owned_item<'v>(
+    frame: Option<&Frame<'_>>,
+    item: &(dyn Val + 'v),
+) -> Result<Box<dyn Val + 'v>, ExecutionError> {
+    if let Some(frame) = frame {
+        if !frame.add_clone(item) {
+            return Err(frame.exceeded());
+        }
+    }
+    Ok(item.clone_as_boxed())
+}
+
+/// Charges the bytes of a value an operator or function just created (see
+/// [`fresh_size`](crate::runtime::fresh_size)), and hands it back. A borrowed
+/// result created nothing.
+#[inline(always)]
+fn charge_fresh<'b, 'v>(
+    frame: Option<&Frame<'_>>,
+    value: CowVal<'b, 'v>,
+) -> Result<CowVal<'b, 'v>, ExecutionError> {
+    if let (Some(frame), CowVal::Owned(v)) = (frame, &value) {
+        if !frame.add_fresh(v.as_ref()) {
+            return Err(frame.exceeded());
+        }
+    }
+    Ok(value)
+}
+
+/// Takes ownership of the result of an operator: charges its creation when it
+/// is owned, and its copy when it is borrowed (say, `l + []` handing back `l`).
+#[inline(always)]
+fn owned_fresh<'v>(
+    frame: Option<&Frame<'_>>,
+    value: CowVal<'_, 'v>,
+) -> Result<Box<dyn Val + 'v>, ExecutionError> {
+    match value {
+        CowVal::Owned(v) => {
+            if let Some(frame) = frame {
+                if !frame.add_fresh(v.as_ref()) {
+                    return Err(frame.exceeded());
+                }
+            }
+            Ok(v)
+        }
+        borrowed => owned(frame, borrowed),
+    }
+}
+
+/// Charges the bytes of converting `value` into a [`Value`].
+#[inline(always)]
+fn charge_conversion(frame: Option<&Frame<'_>>, value: &dyn Val) -> Result<(), ExecutionError> {
+    match frame {
+        Some(frame) => frame.charge_conversion(value),
+        None => Ok(()),
+    }
+}
+
+/// Runs the standard library's `subject.matches(pattern)` under a budget:
+/// compiled and charged by [`Frame::is_match`], by the size of the compiled
+/// automaton, instead of by the overload, which cannot see the frame. The
+/// caller has resolved the overload, so both arguments are strings.
+#[cfg(feature = "regex")]
+#[inline(never)]
+fn budgeted_matches<'b, 'v>(
+    frame: &Frame,
+    args: &[CowVal],
+) -> Result<CowVal<'b, 'v>, ExecutionError> {
+    let string = |i: usize| {
+        args.get(i)
+            .and_then(|arg| arg.downcast_ref::<CelString>())
+            .ok_or_else(|| ExecutionError::InternalError("matches on a non-string".into()))
+    };
+    frame
+        .is_match(string(0)?.inner(), string(1)?.inner())
+        .map(bool)
+}
+
+/// Charges the steps of dispatching the function `name` on `args`: one, plus
+/// one per 64 bytes of the string searched by the string functions whose cost
+/// grows with it, and for `matches`, whose cost grows with the pattern times
+/// the subject, the product of both counts.
+#[inline(always)]
+fn charge_dispatch(ctx: &Context, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
+    match ctx.frame() {
+        Some(frame) => dispatch_in(frame, name, args),
+        None => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn dispatch_in(frame: &Frame, name: &str, args: &[CowVal]) -> Result<(), ExecutionError> {
+    let string_len = |i: usize| {
+        args.get(i)
+            .and_then(|arg| arg.downcast_ref::<CelString>())
+            .map(|s| s.inner().len() as u64)
+    };
+    let scan = match name {
+        "contains" | "startsWith" | "endsWith" => string_len(0).map_or(0, |len| len / 64 + 1),
+        // a string's size counts its characters
+        "size" => string_len(0).map_or(0, |len| len / 64),
+        // the standard library's is limited, priced and charged by
+        // `Frame::is_match`; any other `matches` prices its own work
+        "matches" => match string_len(1) {
+            Some(_) => 0,
+            None => string_len(0).map_or(0, |len| len / 64 + 1),
+        },
+        _ => 0,
+    };
+    match frame.add_steps(1u64.saturating_add(scan)) {
+        true => Ok(()),
+        false => Err(frame.exceeded()),
+    }
+}
+
+/// Charges the steps of comparing `lhs` with `rhs` deeply, for equality or
+/// ordering, see
+/// [`compare_size`]: the cheaper of the two walks, as a comparison stops at
+/// the end of the smaller operand.
+#[inline(always)]
+fn charge_equality(ctx: &Context, lhs: &dyn Val, rhs: &dyn Val) -> Result<(), ExecutionError> {
+    match ctx.frame() {
+        Some(frame) if !equality_in(frame, lhs, rhs) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn equality_in(frame: &Frame, lhs: &dyn Val, rhs: &dyn Val) -> bool {
+    let cap = frame.steps_left();
+    let cost = compare_size(lhs, cap).min(compare_size(rhs, cap));
+    frame.add_steps(cost)
+}
+
+/// Charges the steps of `container[key]`: a map hashes and compares the key,
+/// as `in` on a map does; indexing anything else costs nothing more.
+#[inline(always)]
+fn charge_lookup(ctx: &Context, key: &dyn Val, container: &dyn Val) -> Result<(), ExecutionError> {
+    match ctx.frame() {
+        Some(frame) if !lookup_in(frame, key, container) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn lookup_in(frame: &Frame, key: &dyn Val, container: &dyn Val) -> bool {
+    match container.as_builtin() {
+        BuiltinRef::Map(_) => frame.add_steps(compare_size(key, frame.steps_left())),
+        _ => true,
+    }
+}
+
+/// Charges the steps of `needle in container`: a list compares the needle
+/// with every element, at most the walk of the list; a map hashes the needle.
+#[inline(always)]
+fn charge_membership(
+    ctx: &Context,
+    needle: &dyn Val,
+    container: &dyn Val,
+) -> Result<(), ExecutionError> {
+    match ctx.frame() {
+        Some(frame) if !membership_in(frame, needle, container) => Err(frame.exceeded()),
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn membership_in(frame: &Frame, needle: &dyn Val, container: &dyn Val) -> bool {
+    let cap = frame.steps_left();
+    let cost = match container.as_builtin() {
+        BuiltinRef::List(_) => compare_size(container, cap),
+        _ => compare_size(needle, cap),
+    };
+    frame.add_steps(cost)
 }
 
 /// The name of the function a call on `target` names when `target` spells a
@@ -1818,6 +2100,7 @@ fn resolve_qualified_name<'e, 'p, 'v, 's>(
 /// `left.field`, or `has(left.field)` when `test` is set.
 #[inline(always)]
 fn select_field<'b, 'v>(
+    frame: Option<&Frame<'_>>,
     left: CowVal<'b, 'v>,
     field: &str,
     test: bool,
@@ -1868,7 +2151,7 @@ fn select_field<'b, 'v>(
                 }
                 Ok(CowVal::owned(
                     match index_into(inner, &key, "_._", |_| no_such_key()) {
-                        Ok(v) => CelOptional::of(v.into_owned()),
+                        Ok(v) => CelOptional::of(owned(frame, v)?),
                         Err(e) if e.is_fatal() => return Err(e),
                         Err(_) => CelOptional::none(),
                     },
