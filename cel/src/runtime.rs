@@ -545,7 +545,8 @@ impl<'a> Frame<'a> {
             Some(compiled) => compiled,
             None => self.compile(cache, pattern, size_limit)?,
         };
-        let regex = compiled.regex()?;
+        // the error `matches` reports for an invalid pattern, if it is one
+        compiled.regex()?;
         if !self.add_steps(compiled.scan_steps(subject)) {
             return Err(self.exceeded());
         }
@@ -553,9 +554,13 @@ impl<'a> Frame<'a> {
             Some(scanner) => scanner
                 .is_match(subject, &mut |steps| self.add_steps(steps))
                 .map_err(|_| self.exceeded()),
-            // the NFA without captures is smaller than the one `meta` built
-            // under the same limit: not reached in practice
-            None => Ok(regex.is_match(subject)),
+            // fails closed: the `meta` regex's match is not priced. Its NFA
+            // without captures is smaller than the one `meta` built under
+            // the same limit, so this is not reached in practice
+            None => Err(ExecutionError::function_error(
+                "matches",
+                format!("'{pattern}' cannot be matched under an evaluation budget"),
+            )),
         }
     }
 
@@ -580,7 +585,8 @@ impl<'a> Frame<'a> {
         )) {
             return Err(self.exceeded());
         }
-        let compiled = crate::regex_cache::compile(pattern, size_limit);
+        let compiled =
+            crate::regex_cache::compile(pattern, size_limit, cache.options().budget_dfa_bytes());
         let steps = match compiled.built() {
             0 => pattern.len() as u64 / 64 + 1,
             built => built.saturating_add(compiled.scanner_bytes()) / 8,
@@ -1396,6 +1402,32 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_budgeted_match_without_its_automata_fails_closed() {
+        // the `meta` regex's match is not priced: under a budget, a pattern
+        // that has no automata for it is refused, not matched for free
+        let env = Env::stdlib();
+        let size_limit = crate::regex_cache::size_limit(1 << 20);
+        let compiled = crate::regex_cache::compile("a", size_limit, 256 << 10);
+        env.regex_cache()
+            .insert("a", size_limit, compiled.without_scanner());
+        let mut ctx = Context::with_env(Arc::new(env));
+        assert_eq!(run(&ctx, "'a'.matches('a')"), Ok(true.into()));
+        ctx.set_budget(
+            RuntimeOptions::default()
+                .with_max_steps(10_000)
+                .with_regex_size_limit(1 << 20),
+        );
+        assert_eq!(
+            run(&ctx, "'a'.matches('a')"),
+            Err(ExecutionError::function_error(
+                "matches",
+                "'a' cannot be matched under an evaluation budget"
+            ))
+        );
     }
 
     #[cfg(feature = "regex")]

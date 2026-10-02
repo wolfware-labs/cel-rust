@@ -61,6 +61,9 @@ pub(crate) struct Scanner {
     nfa_states: u64,
     /// The entries of a state's transition table.
     stride: u64,
+    /// The bytes an empty lazy DFA cache holds: after its cache is cleared,
+    /// what it holds beyond this is the states built since.
+    empty_cache: u64,
     /// The literal characters and classes of the pattern, a repetition
     /// counting its copies, plus its Unicode word-boundary assertions: at
     /// most how many NFA threads the slower engine steps at each byte,
@@ -88,10 +91,15 @@ enum Walk {
 }
 
 impl Scanner {
-    /// The automata of the pattern `hir` under `size_limit`, the lazy DFA's
-    /// cache capped at `cache_capacity`, as the `meta` regex's. `None` if
-    /// the NFA exceeds the limit.
-    pub(crate) fn new(hir: &Hir, size_limit: usize, cache_capacity: usize) -> Option<Scanner> {
+    /// The automata of the pattern `hir` under `size_limit`. Each thread's
+    /// lazy DFA cache holds up to `state_bytes` of states beyond the least
+    /// the automaton needs (its sparse sets and a few states of the largest
+    /// size), see [`RegexCacheOptions::with_budget_dfa_bytes`]: a smaller
+    /// cache is cleared more often, and its states built again, each
+    /// charged. `None` if the NFA exceeds the limit.
+    ///
+    /// [`RegexCacheOptions::with_budget_dfa_bytes`]: crate::RegexCacheOptions::with_budget_dfa_bytes
+    pub(crate) fn new(hir: &Hir, size_limit: usize, state_bytes: usize) -> Option<Scanner> {
         let nfa = thompson::Compiler::new()
             .configure(
                 thompson::Config::new()
@@ -103,18 +111,24 @@ impl Scanner {
         let pikevm = pikevm::PikeVM::new_from_nfa(nfa.clone()).ok()?;
         // never gives up: every state it builds is charged, thrashing
         // included
-        let dfa = hybrid::dfa::Builder::new()
-            .configure(
-                hybrid::dfa::Config::new()
-                    .cache_capacity(cache_capacity)
-                    .unicode_word_boundary(true)
-                    .minimum_cache_clear_count(None),
-            )
-            .build_from_nfa(nfa.clone())
-            .ok();
+        let config = hybrid::dfa::Config::new()
+            .unicode_word_boundary(true)
+            .minimum_cache_clear_count(None);
+        let dfa = config
+            .get_minimum_cache_capacity(&nfa)
+            .ok()
+            .and_then(|least| {
+                hybrid::dfa::Builder::new()
+                    .configure(config.cache_capacity(least.saturating_add(state_bytes)))
+                    .build_from_nfa(nfa.clone())
+                    .ok()
+            });
         let stride = dfa
             .as_ref()
             .map_or(0, |dfa| 1u64 << dfa.byte_classes().stride2());
+        let empty_cache = dfa
+            .as_ref()
+            .map_or(0, |dfa| dfa.create_cache().memory_usage() as u64);
         let create: CreateCaches = {
             let (dfa, pikevm) = (dfa.clone(), pikevm.clone());
             Box::new(move || Caches {
@@ -129,6 +143,7 @@ impl Scanner {
             nfa_bytes: nfa.memory_usage() as u64,
             nfa_states: nfa.states().len() as u64,
             stride,
+            empty_cache,
             positions: positions(hir),
         })
     }
@@ -205,10 +220,11 @@ impl Scanner {
         let mut account = |cache: &hybrid::dfa::Cache| -> Result<(), Stopped> {
             let now = cache.memory_usage() as u64;
             let grown = if cache.clear_count() != clears {
-                // the cache was full and cleared: a state was built, its
-                // set's size unknown, so priced at the largest
+                // the cache was full and cleared, then given back the
+                // current state and the one built: price what it holds
+                // beyond an empty cache, as one state
                 clears = cache.clear_count();
-                self.stride * 4 + 36 + self.nfa_states * 5
+                now.saturating_sub(self.empty_cache).max(1)
             } else {
                 now.saturating_sub(used)
             };
@@ -303,7 +319,7 @@ mod tests {
 
     fn scanner(pattern: &str) -> Scanner {
         let hir = syntax::parse_with(pattern, &syntax::Config::new().utf8(true)).unwrap();
-        Scanner::new(&hir, 1 << 20, 1 << 20).unwrap()
+        Scanner::new(&hir, 1 << 20, 256 << 10).unwrap()
     }
 
     fn charged(pattern: &str, subject: &str) -> (bool, u64) {
@@ -405,6 +421,50 @@ mod tests {
         let refused = scanner(r"(?:[ab]|a[ab]|b[ab]{2}){0,80}a[ab]{18}[^ab/]")
             .is_match(&subject, &mut |_| false);
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_thread_s_lazy_dfa_cache_is_bounded() {
+        let pattern = r"(?:[ab]|a[ab]|b[ab]{2}){0,80}a[ab]{18}[^ab/]";
+        let hir = syntax::parse_with(pattern, &syntax::Config::new().utf8(true)).unwrap();
+        let mut state: u64 = 7;
+        let subject: String = (0..8192)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                if (state >> 33) % 2 == 0 {
+                    'a'
+                } else {
+                    'b'
+                }
+            })
+            .collect();
+        for state_bytes in [64 << 10, 256 << 10] {
+            let scanner = Scanner::new(&hir, 1 << 20, state_bytes).unwrap();
+            let (mut small, mut large) = (0u64, 0u64);
+            // every state built is charged, the ones built again included
+            assert!(scanner
+                .is_match(&subject, &mut |n| {
+                    small += n;
+                    true
+                })
+                .is_ok());
+            let held = scanner.caches.get().dfa.as_ref().unwrap().memory_usage();
+            let least = hybrid::dfa::Config::new()
+                .unicode_word_boundary(true)
+                .get_minimum_cache_capacity(scanner.dfa.as_ref().unwrap().get_nfa())
+                .unwrap();
+            assert!(held <= least + state_bytes, "{held} {least} {state_bytes}");
+            // the same subject again: what was cleared is built and charged again
+            assert!(scanner
+                .is_match(&subject, &mut |n| {
+                    large += n;
+                    true
+                })
+                .is_ok());
+            assert!(small > 500_000 && large > 500_000, "{small} {large}");
+        }
     }
 
     #[test]

@@ -86,16 +86,19 @@ pub struct RegexCacheOptions {
     capacity: usize,
     max_pattern_len: usize,
     max_bytes: u64,
+    budget_dfa_bytes: usize,
 }
 
 impl Default for RegexCacheOptions {
     /// 64 patterns, of up to 4,096 bytes each, with up to 64 MiB of
-    /// automata in all.
+    /// automata in all, and 256 KiB of lazy DFA states per pattern and
+    /// thread matching under a budget.
     fn default() -> Self {
         RegexCacheOptions {
             capacity: 64,
             max_pattern_len: 4096,
             max_bytes: 64 << 20,
+            budget_dfa_bytes: 256 << 10,
         }
     }
 }
@@ -147,6 +150,29 @@ impl RegexCacheOptions {
     /// How many bytes of compiled automata the cache keeps at most.
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// How many bytes of lazy DFA states each thread matching a pattern
+    /// under a budget keeps for it, beyond the least its automaton needs
+    /// (two sparse sets of its NFA states, and a few states of the largest
+    /// size: from ~20 KB for a small pattern to ~430 KB for one near
+    /// 1 MiB). 256 KiB by default.
+    ///
+    /// Building a state is charged to the evaluation that builds it, and
+    /// when the cache is full it is cleared and its states built again, at
+    /// a charge too: a smaller cache bounds memory at the cost of more
+    /// steps for patterns whose subjects reach many states, never at the
+    /// cost of an unpriced match. Applies to patterns compiled after it is
+    /// set, see [Memory](Self#memory).
+    pub fn with_budget_dfa_bytes(mut self, bytes: usize) -> Self {
+        self.budget_dfa_bytes = bytes;
+        self
+    }
+
+    /// How many bytes of lazy DFA states each thread matching a pattern
+    /// under a budget keeps for it, beyond the least its automaton needs.
+    pub fn budget_dfa_bytes(&self) -> usize {
+        self.budget_dfa_bytes
     }
 }
 
@@ -292,6 +318,13 @@ impl Compiled {
     /// The bytes of the automata matching under a budget, see [`Scanner`].
     pub(crate) fn scanner_bytes(&self) -> u64 {
         self.scanner.as_ref().map_or(0, |scanner| scanner.bytes())
+    }
+
+    /// This compiled pattern without the automata matching under a budget.
+    #[cfg(test)]
+    pub(crate) fn without_scanner(mut self) -> Compiled {
+        self.scanner = None;
+        self
     }
 
     /// The automata matching under a budget, see [`Scanner`]: `None` for an
@@ -457,7 +490,8 @@ impl RegexCache {
     pub fn prewarm(&self, pattern: &str, regex_size_limit: u64) -> Result<(), ExecutionError> {
         let size_limit = size_limit(regex_size_limit);
         let kept = find(&self.state().index, pattern, size_limit).map(|slot| slot.compiled.clone());
-        let compiled = kept.unwrap_or_else(|| compile(pattern, size_limit));
+        let compiled =
+            kept.unwrap_or_else(|| compile(pattern, size_limit, self.options.budget_dfa_bytes));
         self.pin(pattern, size_limit, compiled).regex().map(|_| ())
     }
 
@@ -613,7 +647,11 @@ impl RegexCache {
     pub(crate) fn get(&self, pattern: &str, size_limit: usize) -> Compiled {
         match self.lookup(pattern, size_limit) {
             Some(compiled) => compiled,
-            None => self.insert(pattern, size_limit, compile(pattern, size_limit)),
+            None => self.insert(
+                pattern,
+                size_limit,
+                compile(pattern, size_limit, self.options.budget_dfa_bytes),
+            ),
         }
     }
 }
@@ -645,7 +683,7 @@ fn add(index: &mut Index, pattern: &Arc<str>, slot: &Arc<Slot>) {
 /// Compiles `pattern` with the configuration of `regex::Regex::new`, so the
 /// result and the error messages are the same, under `size_limit`, which
 /// also caps the lazy DFA's cache.
-pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
+pub(crate) fn compile(pattern: &str, size_limit: usize, budget_dfa_bytes: usize) -> Compiled {
     // parsed as `meta::Builder::build` parses it, so the error is the same,
     // and the syntax looked at once before it is compiled
     let hir = match syntax::parse_with(pattern, &syntax::Config::new().utf8(true)) {
@@ -672,7 +710,7 @@ pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
         Ok(regex) => Compiled {
             built: regex.memory_usage() as u64,
             regex: Ok(Arc::new(regex)),
-            scanner: Scanner::new(&hir, size_limit, cache_capacity).map(Arc::new),
+            scanner: Scanner::new(&hir, size_limit, budget_dfa_bytes).map(Arc::new),
         },
         Err(err) => {
             // as `regex::Error` reports a `meta::BuildError`
@@ -698,6 +736,7 @@ mod tests {
     use super::*;
 
     const DEFAULT: usize = NFA_SIZE_LIMIT;
+    const STATES: usize = 256 << 10;
 
     fn same(a: &Compiled, b: &Compiled) -> bool {
         match (&a.regex, &b.regex) {
@@ -906,8 +945,8 @@ mod tests {
     #[test]
     fn a_racing_insert_keeps_the_first_entry() {
         let cache = RegexCache::default();
-        let first = cache.insert("a", DEFAULT, compile("a", DEFAULT));
-        let second = cache.insert("a", DEFAULT, compile("a", DEFAULT));
+        let first = cache.insert("a", DEFAULT, compile("a", DEFAULT, STATES));
+        let second = cache.insert("a", DEFAULT, compile("a", DEFAULT, STATES));
         assert!(same(&first, &second));
         assert_eq!(cache.len(), 1);
     }
@@ -1041,7 +1080,7 @@ mod tests {
 
     #[test]
     fn the_bytes_of_the_automata_are_capped() {
-        let size = |pattern: &str| compile(pattern, DEFAULT).bytes();
+        let size = |pattern: &str| compile(pattern, DEFAULT, STATES).bytes();
         let (a, b, c) = (size("a+"), size("b+"), size("c+"));
         let cache = RegexCache::new(RegexCacheOptions::default().with_max_bytes(a + b));
         cache.get("a+", DEFAULT);
@@ -1066,7 +1105,7 @@ mod tests {
         assert_eq!(cache.state().bytes, b + c);
         assert_eq!(cache.len(), 3);
         // an error counts its message
-        let error = compile("(", DEFAULT);
+        let error = compile("(", DEFAULT, STATES);
         assert_eq!(
             error.bytes(),
             "'(' not a valid regex:\n".len() as u64 + {
@@ -1086,7 +1125,7 @@ mod tests {
                 .build(pattern)
                 .unwrap_err();
             let message = built.syntax_error().unwrap().to_string();
-            let Err(compiled) = compile(pattern, DEFAULT).regex else {
+            let Err(compiled) = compile(pattern, DEFAULT, STATES).regex else {
                 panic!("{pattern} compiles");
             };
             assert_eq!(
