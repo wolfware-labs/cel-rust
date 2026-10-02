@@ -509,12 +509,17 @@ impl<'a> Frame<'a> {
     ///   and of each bracket and set operand, Perl classes, ranges and nested
     ///   brackets included);
     /// - on a miss only, compiling: one step per 8 bytes of the compiled
-    ///   automaton, or of the size limit when the compile fails for size,
-    ///   as the work up to the limit was done anyway. The compiled pattern
-    ///   is kept in `cache` only once this charge succeeds;
-    /// - matching: two steps per KiB of automaton per 64 bytes of subject
-    ///   (rounded up), charged before matching, as a match can cost up to
-    ///   the automaton's states times the subject.
+    ///   automata (the `meta` regex's, and the NFA matching under a
+    ///   budget), or of the size limit when the compile fails for size, as
+    ///   the work up to the limit was done anyway. The compiled pattern is
+    ///   kept in `cache` only once this charge succeeds;
+    /// - matching, with a lazy DFA of its own that never falls back: two
+    ///   steps per KiB of automaton per 64 bytes of subject (rounded up),
+    ///   charged before matching, for walking states already built; each
+    ///   state built while walking, charged as it is built; and only if the
+    ///   lazy DFA quits (a Unicode word boundary on a non-ASCII byte), the
+    ///   slower engine's bound, by the live positions of the pattern times
+    ///   the subject, charged before it runs. See `regex_scan::Scanner`.
     ///
     /// A pattern compiled by an earlier call, or an earlier evaluation, is
     /// so charged the lookup and the match only.
@@ -540,15 +545,23 @@ impl<'a> Frame<'a> {
             Some(compiled) => compiled,
             None => self.compile(cache, pattern, size_limit)?,
         };
-        let regex = compiled.regex()?;
-        let size = compiled.built();
-        let scan = (size / 1024 + 1)
-            .saturating_mul(subject.len() as u64 / 64 + 1)
-            .saturating_mul(2);
-        if !self.add_steps(scan) {
+        // the error `matches` reports for an invalid pattern, if it is one
+        compiled.regex()?;
+        if !self.add_steps(compiled.scan_steps(subject)) {
             return Err(self.exceeded());
         }
-        Ok(regex.is_match(subject))
+        match compiled.scanner() {
+            Some(scanner) => scanner
+                .is_match(subject, &mut |steps| self.add_steps(steps))
+                .map_err(|_| self.exceeded()),
+            // fails closed: the `meta` regex's match is not priced. Its NFA
+            // without captures is smaller than the one `meta` built under
+            // the same limit, so this is not reached in practice
+            None => Err(ExecutionError::function_error(
+                "matches",
+                format!("'{pattern}' cannot be matched under an evaluation budget"),
+            )),
+        }
     }
 
     /// Compiles `pattern` under `size_limit` into `cache`, charging the
@@ -572,10 +585,11 @@ impl<'a> Frame<'a> {
         )) {
             return Err(self.exceeded());
         }
-        let compiled = crate::regex_cache::compile(pattern, size_limit);
+        let compiled =
+            crate::regex_cache::compile(pattern, size_limit, cache.options().budget_dfa_bytes());
         let steps = match compiled.built() {
             0 => pattern.len() as u64 / 64 + 1,
-            built => built / 8,
+            built => built.saturating_add(compiled.scanner_bytes()) / 8,
         };
         // kept only once paid for: a compile the budget refuses is dropped,
         // so evaluations that are refused cannot fill the cache
@@ -1290,6 +1304,130 @@ mod tests {
             .execute_with_usage(&ctx);
         assert_eq!(result, steps_exceeded(10_000));
         assert!(usage.iterations <= 1, "{usage:?}");
+    }
+
+    /// A string of `len` bytes mixing ASCII letters and digits with
+    /// non-ASCII letters, as a request path can be.
+    #[cfg(feature = "regex")]
+    fn mixed_unicode(len: usize) -> std::string::String {
+        let alphabet: Vec<char> = "abcXYZ019éßπжあ".chars().collect();
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = std::string::String::from("/");
+        loop {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let c = alphabet[(state >> 33) as usize % alphabet.len()];
+            if out.len() + c.len_utf8() > len {
+                return out;
+            }
+            out.push(c);
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_unicode_word_boundary_scans() {
+        // Unicode `\b` makes the lazy DFA quit on a non-ASCII byte, and a
+        // slower engine scans the subject: ~400 ns a byte for this small
+        // automaton, 3.3 ms over 8 KiB, ~40,000 steps
+        let pattern = r"(?:\b\B|\B\b|\b\b\B|\B\B\b)";
+        let limit = 20_000;
+        let mut ctx = with_options(
+            RuntimeOptions::default()
+                .with_max_steps(limit)
+                .with_regex_size_limit(1 << 20),
+        );
+        ctx.add_variable("p", pattern).unwrap();
+        ctx.add_variable("s", mixed_unicode(8 << 10)).unwrap();
+        let ascii = "abc XYZ 019 ".repeat(700);
+        ctx.add_variable("a", ascii.as_str()).unwrap();
+        assert_eq!(run(&ctx, "s.matches(p)"), steps_exceeded(limit));
+        // the lazy DFA runs an ASCII subject: charged by the automaton
+        let (result, usage) = Program::compile("a.matches(p)")
+            .unwrap()
+            .execute_with_usage(&ctx);
+        assert_eq!(result, Ok(false.into()));
+        assert!(usage.steps < 5_000, "{usage:?}");
+    }
+
+    /// A string of `len` bytes drawn from `alphabet`, deterministically.
+    #[cfg(feature = "regex")]
+    fn drawn_from(alphabet: &str, len: usize) -> std::string::String {
+        let alphabet: Vec<char> = alphabet.chars().collect();
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = std::string::String::from("/");
+        loop {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let c = alphabet[(state >> 33) as usize % alphabet.len()];
+            if out.len() + c.len_utf8() > len {
+                return out;
+            }
+            out.push(c);
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn steps_budget_charges_lazy_dfa_states_and_the_slow_engine() {
+        // Each takes 25-70 ms in release, over 300,000 steps at 80 ns: a
+        // single call must not fit in 100,000.
+        let mut failed = vec![];
+        for (pattern, subject) in [
+            // the lazy DFA builds a state per byte, and thrashes its cache
+            (
+                r"(?:[ab]|a[ab]|b[ab]{2}){0,80}a[ab]{18}[^ab/]",
+                drawn_from("ab", 4 << 10),
+            ),
+            // a Unicode word boundary on a non-ASCII byte: the slow engine
+            // scans with hundreds of positions live
+            (
+                r"(?:[a-zé]|[a-h][a-h]|é){0,150}\b\B",
+                drawn_from("abcdefghé", 2 << 10),
+            ),
+        ] {
+            let limit = 100_000;
+            let mut ctx = with_options(
+                RuntimeOptions::default()
+                    .with_max_steps(limit)
+                    .with_regex_size_limit(1 << 20),
+            );
+            ctx.add_variable("p", pattern).unwrap();
+            ctx.add_variable("s", subject).unwrap();
+            let result = run(&ctx, "s.matches(p)");
+            if result != steps_exceeded(limit) {
+                failed.push(format!("{pattern}: {result:?}"));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_budgeted_match_without_its_automata_fails_closed() {
+        // the `meta` regex's match is not priced: under a budget, a pattern
+        // that has no automata for it is refused, not matched for free
+        let env = Env::stdlib();
+        let size_limit = crate::regex_cache::size_limit(1 << 20);
+        let compiled = crate::regex_cache::compile("a", size_limit, 256 << 10);
+        env.regex_cache()
+            .insert("a", size_limit, compiled.without_scanner());
+        let mut ctx = Context::with_env(Arc::new(env));
+        assert_eq!(run(&ctx, "'a'.matches('a')"), Ok(true.into()));
+        ctx.set_budget(
+            RuntimeOptions::default()
+                .with_max_steps(10_000)
+                .with_regex_size_limit(1 << 20),
+        );
+        assert_eq!(
+            run(&ctx, "'a'.matches('a')"),
+            Err(ExecutionError::function_error(
+                "matches",
+                "'a' cannot be matched under an evaluation budget"
+            ))
+        );
     }
 
     #[cfg(feature = "regex")]

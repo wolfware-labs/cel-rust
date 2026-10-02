@@ -23,6 +23,7 @@
 //! sequence of uses on one thread always evicts the same entries; uses
 //! racing on several threads are ordered by the ticks they saw.
 
+use crate::regex_scan::Scanner;
 use crate::ExecutionError;
 use regex_automata::{meta, util::syntax, MatchKind};
 use std::collections::HashMap;
@@ -59,15 +60,32 @@ pub(crate) fn size_limit(regex_size_limit: u64) -> usize {
 /// [`max_bytes`](Self::with_max_bytes), plus the pinned ones (see
 /// [`RegexCache::prewarm`]), which count against neither.
 ///
-/// Each kept regex also keeps the scratch space of its matches: a pool of
-/// caches, one for each thread that matched it at the same time as
-/// another, which stay with the regex. A cache holds a lazy DFA of up to
-/// 2 MiB, or the size limit when smaller, and the state of the other
-/// engines, about the size of the automaton; about 0.6 MiB per pattern and
-/// thread was measured for patterns near 1 MiB. This memory is not counted
-/// by `max_bytes`. With `T` threads matching, the cache can so hold up to
+/// A compiled pattern's automata are the `meta` regex `matches` runs
+/// without a budget, and those it runs under one: an NFA without captures,
+/// a lazy DFA and a PikeVM over it, about a third of the size of the
+/// `meta` regex. Both count against `max_bytes`, and both are in
+/// [`RegexCache::pinned_bytes`].
 ///
-/// `max_bytes + capacity × T × (2 MiB + automaton)`, plus the pinned patterns.
+/// Each kept regex also keeps the scratch space of its matches, which
+/// `max_bytes` does not count: for each thread that matched it at the same
+/// time as another, a cache that stays with the regex.
+///
+/// - Without a budget, a cache holds the `meta` regex's lazy DFA, of up to
+///   2 MiB or the size limit when smaller, and the state of its other
+///   engines, about the size of the automaton: about 0.6 MiB per pattern
+///   and thread was measured for patterns near 1 MiB.
+/// - Under a budget, a cache holds the lazy DFA of the budgeted automata,
+///   of up to [`budget_dfa_bytes`](Self::with_budget_dfa_bytes) (256 KiB by
+///   default) beyond the least the automaton needs (~20 KB for a small
+///   pattern, ~430 KB for one near 1 MiB), and the PikeVM's state, about
+///   the size of its NFA. 32 patterns whose subjects fill it, matched on
+///   16 threads, were measured at ~0.2 MiB per pattern and thread.
+///
+/// With `T` threads matching both with and without a budget, the cache can
+/// so hold up to
+///
+/// `max_bytes + capacity × T × (2 MiB + automaton + budget_dfa_bytes +
+/// least + NFA)`, plus the pinned patterns and their scratch space.
 ///
 /// Without an evaluation budget, patterns compile under the `regex` crate's
 /// default limits, so an automaton is up to 10 MiB: with the defaults, at
@@ -80,16 +98,19 @@ pub struct RegexCacheOptions {
     capacity: usize,
     max_pattern_len: usize,
     max_bytes: u64,
+    budget_dfa_bytes: usize,
 }
 
 impl Default for RegexCacheOptions {
     /// 64 patterns, of up to 4,096 bytes each, with up to 64 MiB of
-    /// automata in all.
+    /// automata in all, and 256 KiB of lazy DFA states per pattern and
+    /// thread matching under a budget.
     fn default() -> Self {
         RegexCacheOptions {
             capacity: 64,
             max_pattern_len: 4096,
             max_bytes: 64 << 20,
+            budget_dfa_bytes: 256 << 10,
         }
     }
 }
@@ -142,6 +163,29 @@ impl RegexCacheOptions {
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
+
+    /// How many bytes of lazy DFA states each thread matching a pattern
+    /// under a budget keeps for it, beyond the least its automaton needs
+    /// (two sparse sets of its NFA states, and a few states of the largest
+    /// size: from ~20 KB for a small pattern to ~430 KB for one near
+    /// 1 MiB). 256 KiB by default.
+    ///
+    /// Building a state is charged to the evaluation that builds it, and
+    /// when the cache is full it is cleared and its states built again, at
+    /// a charge too: a smaller cache bounds memory at the cost of more
+    /// steps for patterns whose subjects reach many states, never at the
+    /// cost of an unpriced match. Applies to patterns compiled after it is
+    /// set, see [Memory](Self#memory).
+    pub fn with_budget_dfa_bytes(mut self, bytes: usize) -> Self {
+        self.budget_dfa_bytes = bytes;
+        self
+    }
+
+    /// How many bytes of lazy DFA states each thread matching a pattern
+    /// under a budget keeps for it, beyond the least its automaton needs.
+    pub fn budget_dfa_bytes(&self) -> usize {
+        self.budget_dfa_bytes
+    }
 }
 
 /// The compiled regular expressions of an [`Env`](crate::Env)'s `matches`,
@@ -179,6 +223,8 @@ struct State {
     bytes: u64,
     /// The pinned entries, which are never evicted.
     pinned: usize,
+    /// The bytes of the pinned entries, see [`Slot::bytes`].
+    pinned_bytes: u64,
 }
 
 fn find<'a>(index: &'a Index, pattern: &str, size_limit: usize) -> Option<&'a Arc<Slot>> {
@@ -234,7 +280,8 @@ struct Slot {
     /// Kept by [`RegexCache::prewarm`]: never evicted.
     pinned: bool,
     /// What the entry counts against [`RegexCacheOptions::with_max_bytes`]:
-    /// the size of the automaton, or of the error message.
+    /// the size of the automata, the budgeted NFA included, or of the error
+    /// message.
     bytes: u64,
     /// The tick the entry was inserted at, unique.
     inserted: u64,
@@ -267,21 +314,51 @@ pub(crate) struct Compiled {
     /// The bytes of automaton compiling built: the regex's size, the size
     /// limit when it was exceeded, zero when the pattern is invalid.
     built: u64,
+    /// The automata matching under a budget, see [`Scanner`].
+    scanner: Option<Arc<Scanner>>,
 }
 
 impl Compiled {
-    /// The bytes the entry holds: the size of the automaton, or of the
-    /// error message.
+    /// The bytes the entry holds: the size of the `meta` regex plus the
+    /// budgeted NFA (see [`Scanner::bytes`]), or of the error message.
     fn bytes(&self) -> u64 {
         match &self.regex {
-            Ok(_) => self.built,
+            Ok(_) => self.built.saturating_add(self.scanner_bytes()),
             Err(message) => message.len() as u64,
         }
+    }
+
+    /// The bytes of the automata matching under a budget, see [`Scanner`].
+    pub(crate) fn scanner_bytes(&self) -> u64 {
+        self.scanner.as_ref().map_or(0, |scanner| scanner.bytes())
+    }
+
+    /// This compiled pattern without the automata matching under a budget.
+    #[cfg(test)]
+    pub(crate) fn without_scanner(mut self) -> Compiled {
+        self.scanner = None;
+        self
+    }
+
+    /// The automata matching under a budget, see [`Scanner`]: `None` for an
+    /// invalid pattern.
+    pub(crate) fn scanner(&self) -> Option<&Scanner> {
+        self.scanner.as_deref()
     }
 
     /// The bytes of automaton compiling built, see the field.
     pub(crate) fn built(&self) -> u64 {
         self.built
+    }
+
+    /// The steps of walking the lazy DFA over `subject` through states it
+    /// has built, charged before matching: two steps per KiB of automaton
+    /// per 64 bytes of subject (rounded up). Building the states, and the
+    /// slower engine, are charged as they run, see [`Scanner::is_match`].
+    pub(crate) fn scan_steps(&self, subject: &str) -> u64 {
+        (self.built / 1024 + 1)
+            .saturating_mul(subject.len() as u64 / 64 + 1)
+            .saturating_mul(2)
     }
 
     /// The regex, or the error `matches` reports for the pattern.
@@ -348,6 +425,24 @@ impl RegexCache {
         self.state().pinned
     }
 
+    /// The bytes the pinned patterns hold (see [`prewarm`](Self::prewarm)):
+    /// the sum of the sizes of their compiled automata, those `matches`
+    /// runs without a budget and the NFA it runs under one (see
+    /// [Memory](RegexCacheOptions#memory)), a pattern pinned as its error
+    /// counting the length of the error message.
+    ///
+    /// Pins count against neither the capacity nor the
+    /// [bytes](RegexCacheOptions::with_max_bytes) of the cache: bound them
+    /// with this. Each `meta` automaton is at most the size limit it was
+    /// compiled under. This does not count the scratch space of the threads
+    /// matching them, see [Memory](RegexCacheOptions#memory): per pattern
+    /// and thread, up to 2 MiB without a budget, and up to
+    /// [`budget_dfa_bytes`](RegexCacheOptions::with_budget_dfa_bytes) plus
+    /// the least the automaton needs under one.
+    pub fn pinned_bytes(&self) -> usize {
+        usize::try_from(self.state().pinned_bytes).unwrap_or(usize::MAX)
+    }
+
     /// Whether the cache holds no compiled pattern.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -361,6 +456,7 @@ impl RegexCache {
         state.len = 0;
         state.bytes = 0;
         state.pinned = 0;
+        state.pinned_bytes = 0;
         for replica in self.replicas.iter() {
             evicted.push(std::mem::take(&mut *write(replica)));
         }
@@ -372,14 +468,17 @@ impl RegexCache {
     /// [`RuntimeOptions::with_regex_size_limit`](crate::RuntimeOptions::with_regex_size_limit)
     /// of `regex_size_limit` (zero meaning the `regex` crate's default), and
     /// pins it: every such evaluation that matches it is then charged as a
-    /// hit, whatever other evaluations add to the cache.
+    /// hit, whatever other evaluations add to the cache. A hit is charged
+    /// the lookup and the match, the first match on a thread included
+    /// building the lazy DFA states its subject needs.
     ///
     /// A pinned pattern is never evicted, and counts neither against the
     /// [capacity](RegexCacheOptions::with_capacity) nor against the
     /// [bytes](RegexCacheOptions::with_max_bytes) of the cache, whatever its
     /// size or length: only [`unpin`](Self::unpin) and [`clear`](Self::clear)
     /// drop it. Pin only the patterns you trust, such as those of the rules
-    /// you load.
+    /// you load, and bound what they hold with
+    /// [`pinned_bytes`](Self::pinned_bytes).
     ///
     /// Under a budget, a pattern that is not pinned is charged its compile
     /// whenever the cache does not hold it, which any evaluation sharing the
@@ -400,15 +499,17 @@ impl RegexCache {
     /// env.regex_cache().prewarm("^/api/v[0-9]+/", 1 << 20).unwrap();
     /// assert!(env.regex_cache().prewarm("(", 1 << 20).is_err());
     ///
+    /// // no compile: the match builds the few lazy DFA states it needs
     /// let mut ctx = Context::with_env(Arc::new(env));
-    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(100).with_regex_size_limit(1 << 20));
+    /// ctx.set_budget(RuntimeOptions::default().with_max_steps(500).with_regex_size_limit(1 << 20));
     /// let program = Program::compile("'/api/v1/users'.matches('^/api/v[0-9]+/')").unwrap();
     /// assert_eq!(program.execute(&ctx), Ok(true.into()));
     /// ```
     pub fn prewarm(&self, pattern: &str, regex_size_limit: u64) -> Result<(), ExecutionError> {
         let size_limit = size_limit(regex_size_limit);
         let kept = find(&self.state().index, pattern, size_limit).map(|slot| slot.compiled.clone());
-        let compiled = kept.unwrap_or_else(|| compile(pattern, size_limit));
+        let compiled =
+            kept.unwrap_or_else(|| compile(pattern, size_limit, self.options.budget_dfa_bytes));
         self.pin(pattern, size_limit, compiled).regex().map(|_| ())
     }
 
@@ -423,6 +524,7 @@ impl RegexCache {
         };
         let pattern = remove_slot(&mut state.index, pattern, &slot);
         state.pinned -= 1;
+        state.pinned_bytes -= slot.bytes;
         self.any_pinned.store(state.pinned > 0, Ordering::Relaxed);
         self.apply(&[(pattern, slot)], None);
         true
@@ -444,6 +546,7 @@ impl RegexCache {
         }
         let pattern = self.add(&mut state, pattern, size_limit, compiled.clone(), true);
         state.pinned += 1;
+        state.pinned_bytes += pattern.1.bytes;
         self.any_pinned.store(true, Ordering::Relaxed);
         self.apply(&removed, Some(&pattern));
         drop(state);
@@ -562,7 +665,11 @@ impl RegexCache {
     pub(crate) fn get(&self, pattern: &str, size_limit: usize) -> Compiled {
         match self.lookup(pattern, size_limit) {
             Some(compiled) => compiled,
-            None => self.insert(pattern, size_limit, compile(pattern, size_limit)),
+            None => self.insert(
+                pattern,
+                size_limit,
+                compile(pattern, size_limit, self.options.budget_dfa_bytes),
+            ),
         }
     }
 }
@@ -594,21 +701,34 @@ fn add(index: &mut Index, pattern: &Arc<str>, slot: &Arc<Slot>) {
 /// Compiles `pattern` with the configuration of `regex::Regex::new`, so the
 /// result and the error messages are the same, under `size_limit`, which
 /// also caps the lazy DFA's cache.
-pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
+pub(crate) fn compile(pattern: &str, size_limit: usize, budget_dfa_bytes: usize) -> Compiled {
+    // parsed as `meta::Builder::build` parses it, so the error is the same,
+    // and the syntax looked at once before it is compiled
+    let hir = match syntax::parse_with(pattern, &syntax::Config::new().utf8(true)) {
+        Ok(hir) => hir,
+        Err(err) => {
+            return Compiled {
+                regex: Err(format!("'{pattern}' not a valid regex:\n{err}").into()),
+                built: 0,
+                scanner: None,
+            }
+        }
+    };
+    let cache_capacity = size_limit.min(DFA_SIZE_LIMIT);
     let built = meta::Builder::new()
         .configure(
             meta::Config::new()
                 .nfa_size_limit(Some(size_limit))
-                .hybrid_cache_capacity(size_limit.min(DFA_SIZE_LIMIT))
+                .hybrid_cache_capacity(cache_capacity)
                 .match_kind(MatchKind::LeftmostFirst)
                 .utf8_empty(true),
         )
-        .syntax(syntax::Config::new().utf8(true))
-        .build(pattern);
+        .build_from_hir(&hir);
     match built {
         Ok(regex) => Compiled {
             built: regex.memory_usage() as u64,
             regex: Ok(Arc::new(regex)),
+            scanner: Scanner::new(&hir, size_limit, budget_dfa_bytes).map(Arc::new),
         },
         Err(err) => {
             // as `regex::Error` reports a `meta::BuildError`
@@ -623,6 +743,7 @@ pub(crate) fn compile(pattern: &str, size_limit: usize) -> Compiled {
             Compiled {
                 regex: Err(format!("'{pattern}' not a valid regex:\n{message}").into()),
                 built,
+                scanner: None,
             }
         }
     }
@@ -633,6 +754,7 @@ mod tests {
     use super::*;
 
     const DEFAULT: usize = NFA_SIZE_LIMIT;
+    const STATES: usize = 256 << 10;
 
     fn same(a: &Compiled, b: &Compiled) -> bool {
         match (&a.regex, &b.regex) {
@@ -841,8 +963,8 @@ mod tests {
     #[test]
     fn a_racing_insert_keeps_the_first_entry() {
         let cache = RegexCache::default();
-        let first = cache.insert("a", DEFAULT, compile("a", DEFAULT));
-        let second = cache.insert("a", DEFAULT, compile("a", DEFAULT));
+        let first = cache.insert("a", DEFAULT, compile("a", DEFAULT, STATES));
+        let second = cache.insert("a", DEFAULT, compile("a", DEFAULT, STATES));
         assert!(same(&first, &second));
         assert_eq!(cache.len(), 1);
     }
@@ -905,6 +1027,31 @@ mod tests {
     }
 
     #[test]
+    fn pinned_bytes_sum_the_pinned_entries() {
+        let cache = RegexCache::new(RegexCacheOptions::default());
+        assert_eq!(cache.pinned_bytes(), 0);
+        cache.prewarm(r"\w{4}", 0).unwrap();
+        cache.prewarm("^/api/", 1 << 20).unwrap();
+        let word = cache.get(r"\w{4}", DEFAULT).bytes();
+        let api = cache.get("^/api/", 1 << 20).bytes();
+        assert!(word > 10_000, "{word}");
+        assert_eq!(cache.pinned_bytes(), (word + api) as usize);
+        // a kept entry is not counted, nor pinning one again
+        cache.get("other", DEFAULT);
+        cache.prewarm(r"\w{4}", 0).unwrap();
+        assert_eq!(cache.pinned_bytes(), (word + api) as usize);
+        // a pinned error holds its message
+        let message = cache.prewarm("(", 0).unwrap_err().to_string();
+        assert!(cache.pinned_bytes() > (word + api) as usize);
+        assert!(cache.pinned_bytes() <= (word + api) as usize + message.len());
+        assert!(cache.unpin("(", 0));
+        assert!(cache.unpin(r"\w{4}", 0));
+        assert_eq!(cache.pinned_bytes(), api as usize);
+        cache.clear();
+        assert_eq!(cache.pinned_bytes(), 0);
+    }
+
+    #[test]
     fn pinning_takes_over_a_kept_entry() {
         let cache = RegexCache::new(RegexCacheOptions::default().with_capacity(2));
         let kept = cache.get("p", DEFAULT);
@@ -951,7 +1098,7 @@ mod tests {
 
     #[test]
     fn the_bytes_of_the_automata_are_capped() {
-        let size = |pattern: &str| compile(pattern, DEFAULT).bytes();
+        let size = |pattern: &str| compile(pattern, DEFAULT, STATES).bytes();
         let (a, b, c) = (size("a+"), size("b+"), size("c+"));
         let cache = RegexCache::new(RegexCacheOptions::default().with_max_bytes(a + b));
         cache.get("a+", DEFAULT);
@@ -976,7 +1123,7 @@ mod tests {
         assert_eq!(cache.state().bytes, b + c);
         assert_eq!(cache.len(), 3);
         // an error counts its message
-        let error = compile("(", DEFAULT);
+        let error = compile("(", DEFAULT, STATES);
         assert_eq!(
             error.bytes(),
             "'(' not a valid regex:\n".len() as u64 + {
@@ -986,6 +1133,24 @@ mod tests {
         );
         cache.clear();
         assert_eq!(cache.state().bytes, 0);
+    }
+
+    #[test]
+    fn errors_are_reported_as_meta_reports_them() {
+        for pattern in ["(", r"\p{Bogus}", "a{2,1}", "(?P<x>a)(?P<x>b)"] {
+            let built = meta::Builder::new()
+                .syntax(syntax::Config::new().utf8(true))
+                .build(pattern)
+                .unwrap_err();
+            let message = built.syntax_error().unwrap().to_string();
+            let Err(compiled) = compile(pattern, DEFAULT, STATES).regex else {
+                panic!("{pattern} compiles");
+            };
+            assert_eq!(
+                &*compiled,
+                format!("'{pattern}' not a valid regex:\n{message}").as_str()
+            );
+        }
     }
 
     #[test]

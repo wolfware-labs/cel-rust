@@ -75,6 +75,11 @@ fn a_prewarmed_pattern_is_a_hit() {
     assert_eq!(env.regex_cache().pinned_len(), 2);
     let mut ctx = context(env);
     ctx.set_budget(gateway_budget());
+    // the first match builds the lazy DFA states the subject needs, ~50 µs
+    let (result, usage) = run(&ctx, "path.matches(p)");
+    assert_eq!(result, Ok(true.into()));
+    assert!(usage.steps <= 1_000, "{usage:?}");
+    // and the next ones walk them
     let (result, usage) = run(&ctx, "path.matches(p)");
     assert_eq!(result, Ok(true.into()));
     assert!(usage.steps <= 60, "{usage:?}");
@@ -132,8 +137,9 @@ fn a_pattern_is_never_served_under_a_smaller_size_limit() {
 
 /// The regression probe: the same ~100-byte pattern matched once per element
 /// of `l`. Without the cache every call paid the parse, the translation and
-/// the compile, ~4,400 steps for this pattern, so the gateway budget refused
-/// the rule at its third element.
+/// the compile, ~5,300 steps for this pattern with the lazy DFA states its
+/// first match builds, so the gateway budget refused the rule at its second
+/// element.
 ///
 /// 2,000 calls cannot fit 10k steps, whatever `matches` costs:
 /// `l.all(x, true)` over 2,000 elements is already 10,004 steps, and each
@@ -142,7 +148,7 @@ fn a_pattern_is_never_served_under_a_smaller_size_limit() {
 #[test]
 fn a_repeated_pattern_fits_the_budget_through_cache_hits() {
     let mut ctx = context(Env::stdlib());
-    ctx.add_variable_from_value("l", (0..80i64).collect::<Vec<_>>());
+    ctx.add_variable_from_value("l", (0..64i64).collect::<Vec<_>>());
     ctx.set_budget(gateway_budget());
     let started = Instant::now();
     let (result, usage) = run(&ctx, "l.all(x, path.matches(p))");
@@ -347,9 +353,10 @@ fn prewarmed_patterns_survive_other_tenants() {
     ctx.add_variable_from_value("path", PATH);
     ctx.add_variable_from_value("p", PATH_PATTERN);
     ctx.set_budget(gateway_budget());
+    // no compile: at most the lazy DFA states the subject needs
     let (result, usage) = run(&ctx, "path.matches(p)");
     assert_eq!(result, Ok(true.into()));
-    assert!(usage.steps <= 60, "{usage:?}");
+    assert!(usage.steps <= 1_000, "{usage:?}");
 }
 
 /// Under a budget, the cache keeps only what an evaluation paid for: a

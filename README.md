@@ -114,5 +114,10 @@ under it. Under a steps budget, only the call that compiles a pattern pays for p
 later calls pay the lookup and the match, and a pattern is kept only once its compile was paid for. Other
 evaluations can evict a kept pattern, so size budgets for compiling every pattern, unless the patterns are
 pinned with `RegexCache::prewarm`. The cache keeps at most 64 MiB of automata by default
-(`RegexCacheOptions::with_max_bytes`), plus the pinned ones, plus each kept regex's matching scratch space:
-up to ~2 MiB per pattern for each thread matching it, so up to 64 × threads × ~2 MiB with the defaults.
+(`RegexCacheOptions::with_max_bytes`), plus the pinned ones (`RegexCache::pinned_bytes`). Both count a
+pattern's automata for matching without a budget and the NFA it matches with under one. On top of that, each
+kept regex keeps the matching scratch space of each thread matching it, which is not counted: up to ~2 MiB per
+pattern and thread without a budget, and under one up to `RegexCacheOptions::with_budget_dfa_bytes` (256 KiB by
+default) of lazy DFA states beyond the least the pattern needs (~20 KB for a small one, ~430 KB near 1 MiB).
+Under a budget, building those states is charged as they are built, so a smaller cache costs steps, not
+unpriced work.

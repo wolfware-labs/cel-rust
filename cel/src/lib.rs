@@ -45,6 +45,8 @@ mod regex_cache;
 pub use regex_cache::{RegexCache, RegexCacheOptions};
 #[cfg(feature = "regex")]
 mod regex_cost;
+#[cfg(feature = "regex")]
+mod regex_scan;
 mod resolvers;
 pub mod runtime;
 pub use runtime::{BudgetKind, Deadline, EvalUsage, Interrupt, RuntimeOptions};
