@@ -1,6 +1,6 @@
 use crate::common::{
-    decls::{Builtin, FunctionDecl, OverloadDecl},
-    functions::Function,
+    decls::FunctionDecl,
+    functions::{EnvFunction, Function, Op},
     types::{self, Type},
     value::CowVal,
 };
@@ -59,6 +59,8 @@ pub struct Env {
     types: TypeRegistry,
     options: RuntimeOptions,
     error_on_duplicate_map_keys: bool,
+    #[cfg(feature = "regex")]
+    regex_cache: crate::RegexCache,
 }
 
 impl Default for Env {
@@ -69,6 +71,8 @@ impl Default for Env {
             types: TypeRegistry::default(),
             options: RuntimeOptions::default(),
             error_on_duplicate_map_keys: true,
+            #[cfg(feature = "regex")]
+            regex_cache: crate::RegexCache::default(),
         }
     }
 }
@@ -119,6 +123,32 @@ impl Env {
         args: Vec<types::Type>,
         op: Function,
     ) -> Result<(), DeclarationError> {
+        self.add_global(name, id, args, Op::Plain(op))
+    }
+
+    /// Adds a global function overload that is handed the evaluation it runs
+    /// in, see [`EnvFunction`]. Otherwise as [`add_overload`](Self::add_overload).
+    ///
+    /// # Errors
+    ///
+    /// As [`add_overload`](Self::add_overload).
+    pub fn add_overload_with_env(
+        &mut self,
+        name: &str,
+        id: &str,
+        args: Vec<types::Type>,
+        op: EnvFunction,
+    ) -> Result<(), DeclarationError> {
+        self.add_global(name, id, args, Op::WithEnv(op))
+    }
+
+    fn add_global(
+        &mut self,
+        name: &str,
+        id: &str,
+        args: Vec<types::Type>,
+        op: Op,
+    ) -> Result<(), DeclarationError> {
         match self.functions.entry(name.to_owned()) {
             Vacant(vacant_entry) => {
                 let mut value = FunctionDecl::new(name);
@@ -142,11 +172,18 @@ impl Env {
     }
 
     /// Finds a global function overload that matches the given name and arguments.
+    ///
+    /// An overload added with [`add_overload_with_env`](Self::add_overload_with_env)
+    /// is not returned: it cannot be called without the evaluation.
     pub fn find_overload(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<Function> {
-        match self.functions.get(name) {
-            None => None,
-            Some(fn_decl) => fn_decl.find_overload(false, args),
-        }
+        self.find_op(name, args).copied().and_then(Op::plain)
+    }
+
+    /// How to call the global overload `name` that `args` call, whatever its kind.
+    pub(crate) fn find_op(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<&Op> {
+        self.functions
+            .get(name)
+            .and_then(|fn_decl| fn_decl.find_op(false, args))
     }
 
     pub(crate) fn has_overload(&self, name: &str) -> bool {
@@ -176,6 +213,35 @@ impl Env {
         args: Vec<types::Type>,
         op: Function,
     ) -> Result<(), DeclarationError> {
+        self.add_member(name, id, target, args, Op::Plain(op))
+    }
+
+    /// Adds a member function overload that is handed the evaluation it runs
+    /// in, see [`EnvFunction`]. Otherwise as
+    /// [`add_member_overload`](Self::add_member_overload).
+    ///
+    /// # Errors
+    ///
+    /// As [`add_member_overload`](Self::add_member_overload).
+    pub fn add_member_overload_with_env(
+        &mut self,
+        name: &str,
+        id: &str,
+        target: Type,
+        args: Vec<types::Type>,
+        op: EnvFunction,
+    ) -> Result<(), DeclarationError> {
+        self.add_member(name, id, target, args, Op::WithEnv(op))
+    }
+
+    fn add_member(
+        &mut self,
+        name: &str,
+        id: &str,
+        target: Type,
+        args: Vec<types::Type>,
+        op: Op,
+    ) -> Result<(), DeclarationError> {
         let mut args = args;
         args.insert(0, target);
         match self.functions.entry(name.to_owned()) {
@@ -193,25 +259,12 @@ impl Env {
         }
     }
 
-    /// Finds a member function overload that matches the given name and arguments.
-    pub(crate) fn find_member_overload(
-        &self,
-        name: &str,
-        args: &[CowVal<'_, '_>],
-    ) -> Option<&OverloadDecl> {
+    /// How to call the member overload `name` that `args` (the receiver
+    /// first) call, whatever its kind.
+    pub(crate) fn find_member_overload(&self, name: &str, args: &[CowVal<'_, '_>]) -> Option<&Op> {
         self.functions
             .get(name)
-            .and_then(|fn_decl| fn_decl.find_overload_decl(true, args))
-    }
-
-    /// Marks the member overload `name`/`id` as the standard library's
-    /// `builtin`, see [`OverloadDecl::builtin`].
-    #[cfg_attr(not(feature = "regex"), allow(dead_code))]
-    pub(crate) fn mark_builtin(&mut self, name: &str, id: &str, builtin: Builtin) {
-        self.functions
-            .get_mut(name)
-            .expect("the builtin function is declared")
-            .mark_builtin(id, builtin);
+            .and_then(|fn_decl| fn_decl.find_op(true, args))
     }
 
     pub(crate) fn has_member_overload(&self, name: &str) -> bool {
@@ -272,6 +325,36 @@ impl Env {
     /// ```
     pub fn set_options(&mut self, options: RuntimeOptions) {
         self.options = options;
+    }
+
+    /// The regular expressions the standard library's `matches` compiled,
+    /// kept for the next call of the same pattern by any evaluation under
+    /// this environment.
+    #[cfg(feature = "regex")]
+    pub fn regex_cache(&self) -> &crate::RegexCache {
+        &self.regex_cache
+    }
+
+    /// Replaces the regex cache with an empty one made with `options`.
+    ///
+    /// # Example
+    /// ```
+    /// use cel::{Context, Env, Program, RegexCacheOptions};
+    /// use std::sync::Arc;
+    ///
+    /// let mut env = Env::stdlib();
+    /// env.set_regex_cache_options(RegexCacheOptions::default().with_capacity(256));
+    /// let env = Arc::new(env);
+    /// let ctx = Context::with_env(env.clone());
+    ///
+    /// let program = Program::compile("['abc', 'abd'].all(s, s.matches('^ab'))").unwrap();
+    /// assert_eq!(program.execute(&ctx), Ok(true.into()));
+    /// // compiled once, for both elements
+    /// assert_eq!(env.regex_cache().len(), 1);
+    /// ```
+    #[cfg(feature = "regex")]
+    pub fn set_regex_cache_options(&mut self, options: crate::RegexCacheOptions) {
+        self.regex_cache = crate::RegexCache::new(options);
     }
 
     /// The types registered with the environment.
@@ -593,5 +676,56 @@ mod tests {
         assert!(env.find_overload("f", &[CowVal::Owned(int)]).is_some());
         assert!(env.has_overload("f") && env.has_overload("g"));
         assert!(!env.has_member_overload("f"));
+    }
+
+    /// Echoes its first argument when it is handed the Env it was added to.
+    fn env_noop<'b, 'v>(
+        ectx: &crate::common::functions::EvalCtx<'_>,
+        args: Vec<CowVal<'b, 'v>>,
+    ) -> Result<CowVal<'b, 'v>, crate::ExecutionError> {
+        assert_eq!(ectx.env().options().max_steps(), 1_234);
+        Ok(args.into_iter().next().unwrap())
+    }
+
+    #[test]
+    fn an_env_overload_is_called_with_the_env() {
+        use crate::{Context, Program};
+        let mut env = Env::default();
+        env.set_options(RuntimeOptions::default().with_max_steps(1_234));
+        env.add_overload_with_env("f", "f_int", vec![types::INT_TYPE], env_noop)
+            .unwrap();
+        env.add_member_overload_with_env("g", "int_g", types::INT_TYPE, vec![], env_noop)
+            .unwrap();
+        let ctx = Context::with_env(std::sync::Arc::new(env));
+        let run = |src: &str| Program::compile(src).unwrap().execute(&ctx);
+        assert_eq!(run("f(7)"), Ok(7.into()));
+        assert_eq!(run("7.g()"), Ok(7.into()));
+        assert_eq!(run("f(7) + 1.g()"), Ok(8.into()));
+    }
+
+    #[test]
+    fn an_env_overload_shares_the_ids_and_signatures_of_plain_ones() {
+        let mut env = Env::default();
+        env.add_overload("f", "f_int", vec![types::INT_TYPE], noop)
+            .unwrap();
+        assert_eq!(
+            env.add_overload_with_env("f", "f_int", vec![types::STRING_TYPE], env_noop),
+            Err(duplicate("f", "f_int"))
+        );
+        assert_eq!(
+            env.add_overload_with_env("f", "other_id", vec![types::INT_TYPE], env_noop),
+            Err(duplicate("f", "other_id"))
+        );
+        assert_eq!(
+            env.add_member_overload_with_env("f", "f_int", types::INT_TYPE, vec![], env_noop),
+            Err(duplicate("f", "f_int"))
+        );
+        // and it is not handed out as a plain function
+        env.add_overload_with_env("h", "h_int", vec![types::INT_TYPE], env_noop)
+            .unwrap();
+        let int = || -> CowVal { CowVal::Owned(Box::new(crate::common::types::CelInt::from(1))) };
+        assert!(env.find_overload("f", &[int()]).is_some());
+        assert!(env.find_overload("h", &[int()]).is_none());
+        assert!(env.has_overload("h"));
     }
 }

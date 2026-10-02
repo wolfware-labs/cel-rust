@@ -1,6 +1,4 @@
 use crate::common::ast::{operators, ComprehensionExpr, EntryExpr, Expr};
-#[cfg(feature = "regex")]
-use crate::common::decls::Builtin;
 use crate::common::types::bool::Bool;
 use crate::common::types::map;
 use crate::common::types::optional::{unwrap_optional, Unwrapped};
@@ -1462,19 +1460,10 @@ impl Value {
                         let target = Value::resolve_val(target_expr, ctx)?;
                         args.insert(0, target);
                         charge_dispatch(ctx, &call.func_name, &args)?;
-                        if let Some(overload) =
-                            ctx.env().find_member_overload(&call.func_name, &args)
-                        {
-                            // Under a budget, the standard library's
-                            // `string.matches` is run by the interpreter, which
-                            // can charge the compiled regex; nothing else is.
-                            #[cfg(feature = "regex")]
-                            if let (Some(frame), Some(Builtin::StringMatches)) =
-                                (ctx.frame(), overload.builtin())
-                            {
-                                return budgeted_matches(frame, &args);
-                            }
-                            return charge_fresh(ctx.frame(), (overload.op())(args)?);
+                        let env = ctx.env();
+                        if let Some(op) = env.find_member_overload(&call.func_name, &args) {
+                            let frame = ctx.frame();
+                            return charge_fresh(frame, op.call(env, frame, args)?);
                         }
                         let func = match ctx.get_function(&call.func_name) {
                             Some(func) => func,
@@ -1831,8 +1820,10 @@ fn call_function<'e, 'p, 'v>(
     args: Vec<CowVal<'e, 'v>>,
 ) -> Result<CowVal<'e, 'v>, ExecutionError> {
     charge_dispatch(ctx, ftx_name, &args)?;
-    if let Some(op) = ctx.env().find_overload(name, &args) {
-        return charge_fresh(ctx.frame(), op(args)?);
+    let env = ctx.env();
+    if let Some(op) = env.find_op(name, &args) {
+        let frame = ctx.frame();
+        return charge_fresh(frame, op.call(env, frame, args)?);
     }
     let func = match ctx.get_function(name) {
         Some(func) => func,
@@ -1924,26 +1915,6 @@ fn charge_conversion(frame: Option<&Frame<'_>>, value: &dyn Val) -> Result<(), E
         Some(frame) => frame.charge_conversion(value),
         None => Ok(()),
     }
-}
-
-/// Runs the standard library's `subject.matches(pattern)` under a budget:
-/// compiled and charged by [`Frame::is_match`], by the size of the compiled
-/// automaton, instead of by the overload, which cannot see the frame. The
-/// caller has resolved the overload, so both arguments are strings.
-#[cfg(feature = "regex")]
-#[inline(never)]
-fn budgeted_matches<'b, 'v>(
-    frame: &Frame,
-    args: &[CowVal],
-) -> Result<CowVal<'b, 'v>, ExecutionError> {
-    let string = |i: usize| {
-        args.get(i)
-            .and_then(|arg| arg.downcast_ref::<CelString>())
-            .ok_or_else(|| ExecutionError::InternalError("matches on a non-string".into()))
-    };
-    frame
-        .is_match(string(0)?.inner(), string(1)?.inner())
-        .map(bool)
 }
 
 /// Charges the steps of dispatching the function `name` on `args`: one, plus

@@ -198,8 +198,13 @@ impl RuntimeOptions {
     /// functions `contains`, `startsWith` and `endsWith` one step per 64
     /// bytes of the string searched, and the standard library's `matches`
     /// by its pattern (parsing, translating and compiling it, priced before
-    /// each runs) and by the size of its compiled automaton times the
-    /// subject's length, charged before matching.
+    /// each runs, and paid only by the call that compiles it: the
+    /// [`Env`](crate::Env)'s [`RegexCache`](crate::RegexCache) keeps it for
+    /// later calls) and by the size of its compiled automaton times the
+    /// subject's length, charged before matching. Other evaluations sharing
+    /// the Env can evict a kept pattern: size the budget for compiling every
+    /// pattern the expression matches, unless they are pinned with
+    /// [`RegexCache::prewarm`](crate::RegexCache::prewarm).
     /// Comparisons (`==`, `!=`, `in`) are charged by a walk of their
     /// operands, one step per element and per 64 bytes of string. Creating a
     /// value costs one step per element or entry, or per 64 bytes of a string
@@ -303,6 +308,10 @@ impl RuntimeOptions {
     /// with Unicode word characters, and compiling 1 MiB takes about 10 ms.
     /// Zero, the default, keeps the `regex` crate's limits (10 MiB, with a
     /// 2 MiB cache).
+    ///
+    /// The [`RegexCache`](crate::RegexCache) keeps a pattern under the limit
+    /// it was compiled with: it is never served to an evaluation with
+    /// another limit, which compiles it again.
     pub fn with_regex_size_limit(mut self, bytes: u64) -> Self {
         self.regex_size_limit = bytes;
         self
@@ -479,31 +488,43 @@ impl<'a> Frame<'a> {
         usize::try_from(elements).unwrap_or(usize::MAX)
     }
 
-    /// Compiles `pattern` and matches it against `subject`, as `matches`
-    /// does, charging the steps the compiled automaton costs. A pattern
-    /// longer than [`RuntimeOptions::with_max_regex_len`] is refused first.
+    /// Matches `pattern` against `subject`, as `matches` does, charging the
+    /// steps it costs. A pattern longer than
+    /// [`RuntimeOptions::with_max_regex_len`] is refused first.
     ///
     /// The pattern is compiled with the same configuration as
     /// `regex::Regex::new` (so the result and the error messages are the
-    /// same), bounded by [`RuntimeOptions::with_regex_size_limit`]. The
-    /// charges are calibrated on measured CPU, about 80 ns per step:
+    /// same), bounded by [`RuntimeOptions::with_regex_size_limit`], and kept
+    /// in `cache` under that limit, its error included. The charges are
+    /// calibrated on measured CPU, about 80 ns per step:
     ///
-    /// - parsing: the pattern is parsed twice, to price it and to compile
-    ///   it, each charged per byte before either runs, see
+    /// - the lookup: one step per 64 bytes of pattern (rounded up), for
+    ///   hashing and comparing it;
+    /// - on a miss only, parsing: the pattern is parsed twice, to price it
+    ///   and to compile it, each charged per byte before either runs, see
     ///   `regex_cost::parse_steps`;
-    /// - translating: priced from the parsed pattern before compiling, see
-    ///   `regex_cost::translation_steps` (Unicode and Perl classes, and under
-    ///   `(?i)` every case fold: of each Unicode class, and of each bracket
-    ///   and set operand, Perl classes, ranges and nested brackets included);
-    /// - compiling: one step per 8 bytes of the compiled automaton, or of the
-    ///   size limit when the compile fails for size, as the work up to the
-    ///   limit was done anyway;
+    /// - on a miss only, translating: priced from the parsed pattern before
+    ///   compiling, see `regex_cost::translation_steps` (Unicode and Perl
+    ///   classes, and under `(?i)` every case fold: of each Unicode class,
+    ///   and of each bracket and set operand, Perl classes, ranges and nested
+    ///   brackets included);
+    /// - on a miss only, compiling: one step per 8 bytes of the compiled
+    ///   automaton, or of the size limit when the compile fails for size,
+    ///   as the work up to the limit was done anyway. The compiled pattern
+    ///   is kept in `cache` only once this charge succeeds;
     /// - matching: two steps per KiB of automaton per 64 bytes of subject
     ///   (rounded up), charged before matching, as a match can cost up to
     ///   the automaton's states times the subject.
+    ///
+    /// A pattern compiled by an earlier call, or an earlier evaluation, is
+    /// so charged the lookup and the match only.
     #[cfg(feature = "regex")]
-    pub(crate) fn is_match(&self, subject: &str, pattern: &str) -> Result<bool, ExecutionError> {
-        use regex_automata::{meta, util::syntax, MatchKind};
+    pub(crate) fn is_match(
+        &self,
+        cache: &crate::RegexCache,
+        subject: &str,
+        pattern: &str,
+    ) -> Result<bool, ExecutionError> {
         let (len, limit) = (pattern.len() as u64, self.max_regex_len);
         if limit > 0 && len > limit {
             return Err(ExecutionError::function_error(
@@ -511,6 +532,35 @@ impl<'a> Frame<'a> {
                 format!("regex pattern of {len} bytes exceeds the limit of {limit} bytes"),
             ));
         }
+        if !self.add_steps(len / 64 + 1) {
+            return Err(self.exceeded());
+        }
+        let size_limit = crate::regex_cache::size_limit(self.regex_size_limit);
+        let compiled = match cache.lookup(pattern, size_limit) {
+            Some(compiled) => compiled,
+            None => self.compile(cache, pattern, size_limit)?,
+        };
+        let regex = compiled.regex()?;
+        let size = compiled.built();
+        let scan = (size / 1024 + 1)
+            .saturating_mul(subject.len() as u64 / 64 + 1)
+            .saturating_mul(2);
+        if !self.add_steps(scan) {
+            return Err(self.exceeded());
+        }
+        Ok(regex.is_match(subject))
+    }
+
+    /// Compiles `pattern` under `size_limit` into `cache`, charging the
+    /// parsing and the translation before it, and the compile after.
+    #[cfg(feature = "regex")]
+    #[inline(never)]
+    fn compile(
+        &self,
+        cache: &crate::RegexCache,
+        pattern: &str,
+        size_limit: usize,
+    ) -> Result<crate::regex_cache::Compiled, ExecutionError> {
         // parsing the pattern twice, to price it and to compile it, then
         // translating it, priced from its syntax: each charged before it runs
         if !self.add_steps(crate::regex_cost::parse_steps(pattern)) {
@@ -522,55 +572,17 @@ impl<'a> Frame<'a> {
         )) {
             return Err(self.exceeded());
         }
-        // `regex::RegexBuilder`'s defaults
-        const NFA_SIZE_LIMIT: usize = 10 << 20;
-        const DFA_SIZE_LIMIT: usize = 2 << 20;
-        let (nfa_limit, dfa_limit) = match self.regex_size_limit {
-            0 => (NFA_SIZE_LIMIT, DFA_SIZE_LIMIT),
-            limit => {
-                let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-                (limit, limit.min(DFA_SIZE_LIMIT))
-            }
+        let compiled = crate::regex_cache::compile(pattern, size_limit);
+        let steps = match compiled.built() {
+            0 => pattern.len() as u64 / 64 + 1,
+            built => built / 8,
         };
-        let built = meta::Builder::new()
-            .configure(
-                meta::Config::new()
-                    .nfa_size_limit(Some(nfa_limit))
-                    .hybrid_cache_capacity(dfa_limit)
-                    .match_kind(MatchKind::LeftmostFirst)
-                    .utf8_empty(true),
-            )
-            .syntax(syntax::Config::new().utf8(true))
-            .build(pattern);
-        let regex = match built {
-            Ok(regex) => regex,
-            Err(err) => {
-                // as `regex::Error` reports a `meta::BuildError`
-                let (steps, message) = match (err.size_limit(), err.syntax_error()) {
-                    (Some(limit), _) => (
-                        limit as u64 / 8,
-                        format!("Compiled regex exceeds size limit of {limit} bytes."),
-                    ),
-                    (None, Some(syntax)) => (pattern.len() as u64 / 64 + 1, syntax.to_string()),
-                    (None, None) => (pattern.len() as u64 / 64 + 1, err.to_string()),
-                };
-                if !self.add_steps(steps) {
-                    return Err(self.exceeded());
-                }
-                return Err(ExecutionError::function_error(
-                    "matches",
-                    format!("'{pattern}' not a valid regex:\n{message}"),
-                ));
-            }
-        };
-        let size = regex.memory_usage() as u64;
-        let scan = (size / 1024 + 1)
-            .saturating_mul(subject.len() as u64 / 64 + 1)
-            .saturating_mul(2);
-        if !self.add_steps((size / 8).saturating_add(scan)) {
-            return Err(self.exceeded());
+        // kept only once paid for: a compile the budget refuses is dropped,
+        // so evaluations that are refused cannot fill the cache
+        match self.add_steps(steps) {
+            true => Ok(cache.insert(pattern, size_limit, compiled)),
+            false => Err(self.exceeded()),
         }
-        Ok(regex.is_match(subject))
     }
 
     /// The resources used so far by the evaluation.
@@ -1363,6 +1375,90 @@ mod tests {
                 "{}",
                 &src[..src.len().min(24)]
             );
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_budget_keeps_an_env_overload_named_matches() {
+        use crate::common::functions::EvalCtx;
+        use crate::common::types::{CelBool, CelString, STRING_TYPE};
+        use crate::common::value::CowVal;
+        fn glob(this: &CelString, pattern: &CelString) -> CelBool {
+            CelBool::from(pattern.inner() == "*" || this.inner() == pattern.inner())
+        }
+        fn plain<'b, 'v>(args: Vec<CowVal<'b, 'v>>) -> Result<CowVal<'b, 'v>, ExecutionError> {
+            let string = |i: usize| args[i].downcast_ref::<CelString>().unwrap();
+            Ok(CowVal::owned(glob(string(0), string(1))))
+        }
+        fn with_env<'b, 'v>(
+            _: &EvalCtx<'_>,
+            args: Vec<CowVal<'b, 'v>>,
+        ) -> Result<CowVal<'b, 'v>, ExecutionError> {
+            plain(args)
+        }
+        // a pattern over `max_regex_len`, and one over the size limit,
+        // included: the limits are the stdlib's
+        let long = "a".repeat(576);
+        let cases = [
+            ("'abc'.matches('*')".to_owned(), true),
+            ("'abc'.matches('a.c')".to_owned(), false),
+            (r"'a'.matches(r'\w{1000}')".to_owned(), false),
+            (format!("'abc'.matches('{long}')"), false),
+            (format!("'{long}'.matches('{long}')"), true),
+        ];
+        // an embedder's `matches`, plain or Env-aware, member or global
+        type MakeEnv = fn() -> Env;
+        let envs: [(&str, MakeEnv); 4] = [
+            ("plain member", || {
+                let mut env = Env::default();
+                env.add_member_overload("matches", "m", STRING_TYPE, vec![STRING_TYPE], plain)
+                    .unwrap();
+                env
+            }),
+            ("Env-aware member", || {
+                let mut env = Env::default();
+                env.add_member_overload_with_env(
+                    "matches",
+                    "m",
+                    STRING_TYPE,
+                    vec![STRING_TYPE],
+                    with_env,
+                )
+                .unwrap();
+                env
+            }),
+            ("plain global", || {
+                let mut env = Env::default();
+                env.add_overload("matches", "m", vec![STRING_TYPE, STRING_TYPE], plain)
+                    .unwrap();
+                env
+            }),
+            ("Env-aware global", || {
+                let mut env = Env::default();
+                env.add_overload_with_env("matches", "m", vec![STRING_TYPE, STRING_TYPE], with_env)
+                    .unwrap();
+                env
+            }),
+        ];
+        for (kind, env) in envs {
+            for (src, expected) in &cases {
+                let src = match kind.ends_with("member") {
+                    true => src.clone(),
+                    // `'s'.matches('p')` as `matches('s', 'p')`
+                    false => {
+                        let (this, rest) = src.split_once(".matches(").unwrap();
+                        format!("matches({this}, {rest}")
+                    }
+                };
+                let ctx = Context::with_env(Arc::new(env()));
+                assert_eq!(
+                    same_with_and_without_budget(ctx, &src),
+                    Ok((*expected).into()),
+                    "{kind}: {}",
+                    &src[..src.len().min(24)]
+                );
+            }
         }
     }
 

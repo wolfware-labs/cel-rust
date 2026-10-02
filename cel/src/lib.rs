@@ -40,6 +40,10 @@ pub mod functions;
 mod magic;
 pub mod objects;
 #[cfg(feature = "regex")]
+mod regex_cache;
+#[cfg(feature = "regex")]
+pub use regex_cache::{RegexCache, RegexCacheOptions};
+#[cfg(feature = "regex")]
 mod regex_cost;
 mod resolvers;
 pub mod runtime;
