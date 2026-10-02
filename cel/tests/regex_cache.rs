@@ -72,6 +72,7 @@ fn a_prewarmed_pattern_is_a_hit() {
     // another limit is another entry
     env.regex_cache().prewarm(PATH_PATTERN, 0).unwrap();
     assert_eq!(env.regex_cache().len(), 2);
+    assert_eq!(env.regex_cache().pinned_len(), 2);
     let mut ctx = context(env);
     ctx.set_budget(gateway_budget());
     let (result, usage) = run(&ctx, "path.matches(p)");
@@ -322,6 +323,33 @@ fn env_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Env>();
     assert_send_sync::<cel::RegexCache>();
+}
+
+/// Other tenants of a shared Env cannot evict what was prewarmed: their
+/// misses would otherwise flip a rule sized for warm patterns to refused.
+#[test]
+fn prewarmed_patterns_survive_other_tenants() {
+    let env = Arc::new(Env::stdlib());
+    env.regex_cache().prewarm(PATH_PATTERN, 1 << 20).unwrap();
+    // far more distinct patterns than the cache holds
+    let mut attacker = Context::with_env(env.clone());
+    attacker.add_variable_from_value("l", (0..500i64).collect::<Vec<_>>());
+    attacker.add_variable_from_value("path", PATH);
+    assert_eq!(
+        run(
+            &attacker,
+            "l.all(x, !path.matches('^/z' + string(x) + '$'))"
+        )
+        .0,
+        Ok(true.into())
+    );
+    let mut ctx = Context::with_env(env);
+    ctx.add_variable_from_value("path", PATH);
+    ctx.add_variable_from_value("p", PATH_PATTERN);
+    ctx.set_budget(gateway_budget());
+    let (result, usage) = run(&ctx, "path.matches(p)");
+    assert_eq!(result, Ok(true.into()));
+    assert!(usage.steps <= 60, "{usage:?}");
 }
 
 /// Under a budget, the cache keeps only what an evaluation paid for: a

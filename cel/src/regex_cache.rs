@@ -26,7 +26,7 @@
 use crate::ExecutionError;
 use regex_automata::{meta, util::syntax, MatchKind};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The `regex` crate's default limit on the size of a compiled pattern.
@@ -108,6 +108,8 @@ pub struct RegexCache {
     /// The entries, as insertions and evictions see them: each is decided
     /// under this lock, and then applied to every replica.
     state: Mutex<State>,
+    /// Whether any entry is pinned, read by lookups without the mutex.
+    any_pinned: AtomicBool,
     /// Copies of the index of the entries, one per group of threads. A hit
     /// takes its own replica's lock, shared: hits on threads of different
     /// groups touch no common lock, and hits in one group do not exclude
@@ -126,7 +128,10 @@ struct Replica(RwLock<Index>);
 #[derive(Default)]
 struct State {
     index: Index,
+    /// The entries that can be evicted.
     len: usize,
+    /// The pinned entries, which are never evicted.
+    pinned: usize,
 }
 
 fn find<'a>(index: &'a Index, pattern: &str, size_limit: usize) -> Option<&'a Arc<Slot>> {
@@ -141,17 +146,19 @@ impl State {
     /// among those used as recently, which makes it one entry, whatever the
     /// order of the map. The cache is not empty.
     fn evict_least_recently_used(&mut self) -> (Arc<str>, Arc<Slot>) {
-        let (pattern, index) =
-            self.index
-                .iter()
-                .flat_map(|(pattern, slots)| {
-                    slots.iter().enumerate().map(move |(index, slot)| {
-                        ((slot.last_used(), slot.inserted), pattern, index)
-                    })
-                })
-                .min_by_key(|(recency, _, _)| *recency)
-                .map(|(_, pattern, index)| (pattern.clone(), index))
-                .expect("a full cache has an entry");
+        let (pattern, index) = self
+            .index
+            .iter()
+            .flat_map(|(pattern, slots)| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| !slot.pinned)
+                    .map(move |(index, slot)| ((slot.last_used(), slot.inserted), pattern, index))
+            })
+            .min_by_key(|(recency, _, _)| *recency)
+            .map(|(_, pattern, index)| (pattern.clone(), index))
+            .expect("a full cache has an entry it can evict");
         let slot = remove(&mut self.index, &pattern, |slots| slots.swap_remove(index));
         self.len -= 1;
         (pattern, slot)
@@ -176,6 +183,8 @@ fn remove(
 struct Slot {
     size_limit: usize,
     compiled: Compiled,
+    /// Kept by [`RegexCache::prewarm`]: never evicted.
+    pinned: bool,
     /// The tick the entry was inserted at, unique.
     inserted: u64,
     /// When the entry was last used: twice the tick of its insertion, or
@@ -256,6 +265,7 @@ impl RegexCache {
             options,
             tick: AtomicU64::new(0),
             state: Mutex::default(),
+            any_pinned: AtomicBool::new(false),
             replicas: (0..replicas).map(|_| Replica::default()).collect(),
         }
     }
@@ -266,9 +276,16 @@ impl RegexCache {
     }
 
     /// How many compiled patterns the cache holds, counting a pattern once
-    /// per size limit it was compiled under.
+    /// per size limit it was compiled under, the pinned ones included.
     pub fn len(&self) -> usize {
-        self.state().len
+        let state = self.state();
+        state.len + state.pinned
+    }
+
+    /// How many of the compiled patterns are pinned, see
+    /// [`prewarm`](Self::prewarm).
+    pub fn pinned_len(&self) -> usize {
+        self.state().pinned
     }
 
     /// Whether the cache holds no compiled pattern.
@@ -276,15 +293,15 @@ impl RegexCache {
         self.len() == 0
     }
 
-    /// Drops every compiled pattern.
+    /// Drops every compiled pattern, the pinned ones included.
     pub fn clear(&self) {
         let mut state = self.state();
-        let mut evicted = vec![std::mem::take(&mut *state)];
+        self.any_pinned.store(false, Ordering::Relaxed);
+        let mut evicted = vec![std::mem::take(&mut state.index)];
+        state.len = 0;
+        state.pinned = 0;
         for replica in self.replicas.iter() {
-            evicted.push(State {
-                index: std::mem::take(&mut *write(replica)),
-                len: 0,
-            });
+            evicted.push(std::mem::take(&mut *write(replica)));
         }
         drop(state);
         drop(evicted);
@@ -293,13 +310,23 @@ impl RegexCache {
     /// Compiles `pattern` as `matches` does in an evaluation with a
     /// [`RuntimeOptions::with_regex_size_limit`](crate::RuntimeOptions::with_regex_size_limit)
     /// of `regex_size_limit` (zero meaning the `regex` crate's default), and
-    /// keeps it: the first such evaluation to match it is then charged as a
-    /// hit. Patterns the cache does not keep (see [`RegexCacheOptions`]) are
-    /// compiled and dropped.
+    /// pins it: every such evaluation that matches it is then charged as a
+    /// hit, whatever other evaluations add to the cache.
+    ///
+    /// A pinned pattern is never evicted, and does not count against the
+    /// [capacity](RegexCacheOptions::with_capacity) of the cache, whatever
+    /// its size or length: only [`unpin`](Self::unpin) and
+    /// [`clear`](Self::clear) drop it. Pin only the patterns you trust, such as those of the rules
+    /// you load.
+    ///
+    /// Under a budget, a pattern that is not pinned is charged its compile
+    /// whenever the cache does not hold it, which any evaluation sharing the
+    /// Env can cause by filling the cache: size budgets for that cold case,
+    /// unless every pattern the expression matches is pinned.
     ///
     /// # Errors
     ///
-    /// The error `matches` reports for the pattern, which is kept too.
+    /// The error `matches` reports for the pattern, which is pinned too.
     ///
     /// # Example
     /// ```
@@ -317,9 +344,48 @@ impl RegexCache {
     /// assert_eq!(program.execute(&ctx), Ok(true.into()));
     /// ```
     pub fn prewarm(&self, pattern: &str, regex_size_limit: u64) -> Result<(), ExecutionError> {
-        self.get(pattern, size_limit(regex_size_limit))
-            .regex()
-            .map(|_| ())
+        let size_limit = size_limit(regex_size_limit);
+        let kept = find(&self.state().index, pattern, size_limit).map(|slot| slot.compiled.clone());
+        let compiled = kept.unwrap_or_else(|| compile(pattern, size_limit));
+        self.pin(pattern, size_limit, compiled).regex().map(|_| ())
+    }
+
+    /// Unpins `pattern` under `regex_size_limit` (see [`prewarm`](Self::prewarm))
+    /// and drops it. Returns whether it was pinned.
+    pub fn unpin(&self, pattern: &str, regex_size_limit: u64) -> bool {
+        let size_limit = size_limit(regex_size_limit);
+        let mut state = self.state();
+        let slot = match find(&state.index, pattern, size_limit) {
+            Some(slot) if slot.pinned => slot.clone(),
+            _ => return false,
+        };
+        let pattern = remove_slot(&mut state.index, pattern, &slot);
+        state.pinned -= 1;
+        self.any_pinned.store(state.pinned > 0, Ordering::Relaxed);
+        self.apply(&[(pattern, slot)], None);
+        true
+    }
+
+    /// Keeps `compiled` pinned, replacing the entry of `pattern` under
+    /// `size_limit` if it is not, and hands back the pinned entry.
+    fn pin(&self, pattern: &str, size_limit: usize, compiled: Compiled) -> Compiled {
+        let mut state = self.state();
+        let mut removed = Vec::new();
+        if let Some(slot) = find(&state.index, pattern, size_limit) {
+            if slot.pinned {
+                return slot.compiled.clone();
+            }
+            let slot = slot.clone();
+            removed.push((remove_slot(&mut state.index, pattern, &slot), slot));
+            state.len -= 1;
+        }
+        let pattern = self.add(&mut state, pattern, size_limit, compiled.clone(), true);
+        state.pinned += 1;
+        self.any_pinned.store(true, Ordering::Relaxed);
+        self.apply(&removed, Some(&pattern));
+        drop(state);
+        drop(removed);
+        compiled
     }
 
     // The maps are consistent between statements: a panic cannot leave one
@@ -348,7 +414,7 @@ impl RegexCache {
     /// marked as used. Takes this thread's replica shared, and only reads
     /// shared memory, but for the first hit on an entry since an insertion.
     pub(crate) fn lookup(&self, pattern: &str, size_limit: usize) -> Option<Compiled> {
-        if !self.keeps(pattern) {
+        if !self.keeps(pattern) && !self.any_pinned.load(Ordering::Relaxed) {
             return None;
         }
         let index = self.replica();
@@ -373,10 +439,30 @@ impl RegexCache {
         while state.len >= self.options.capacity {
             evicted.push(state.evict_least_recently_used());
         }
+        let added = self.add(&mut state, pattern, size_limit, compiled.clone(), false);
+        state.len += 1;
+        self.apply(&evicted, Some(&added));
+        // the evicted regexes are freed after the locks are released
+        drop(state);
+        drop(evicted);
+        compiled
+    }
+
+    /// Adds a new entry to the index of `state`, and hands it back with its
+    /// pattern, for [`apply`](Self::apply).
+    fn add(
+        &self,
+        state: &mut State,
+        pattern: &str,
+        size_limit: usize,
+        compiled: Compiled,
+        pinned: bool,
+    ) -> (Arc<str>, Arc<Slot>) {
         let tick = self.next_tick();
         let slot = Arc::new(Slot {
             size_limit,
-            compiled: compiled.clone(),
+            compiled,
+            pinned,
             inserted: tick,
             last_used: AtomicU64::new(tick.saturating_mul(2)),
         });
@@ -385,24 +471,21 @@ impl RegexCache {
             None => pattern.into(),
         };
         add(&mut state.index, &pattern, &slot);
-        state.len += 1;
+        (pattern, slot)
+    }
+
+    /// Applies to every replica the removal of `removed` and the addition
+    /// of `added`, already made to the state, whose lock the caller holds.
+    fn apply(&self, removed: &[(Arc<str>, Arc<Slot>)], added: Option<&(Arc<str>, Arc<Slot>)>) {
         for replica in self.replicas.iter() {
             let mut index = write(replica);
-            for (pattern, slot) in &evicted {
-                remove(&mut index, pattern, |slots| {
-                    let at = slots
-                        .iter()
-                        .position(|kept| Arc::ptr_eq(kept, slot))
-                        .expect("the replica holds the entry");
-                    slots.swap_remove(at)
-                });
+            for (pattern, slot) in removed {
+                remove_slot(&mut index, pattern, slot);
             }
-            add(&mut index, &pattern, &slot);
+            if let Some((pattern, slot)) = added {
+                add(&mut index, pattern, slot);
+            }
         }
-        // the evicted regexes are freed after the locks are released
-        drop(state);
-        drop(evicted);
-        compiled
     }
 
     /// The compiled `pattern` under `size_limit`, compiling it, outside the
@@ -417,6 +500,23 @@ impl RegexCache {
 
 fn write(replica: &Replica) -> RwLockWriteGuard<'_, Index> {
     replica.0.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Removes `slot` from the entries of `pattern`, and hands back the pattern
+/// as the index keeps it.
+fn remove_slot(index: &mut Index, pattern: &str, slot: &Arc<Slot>) -> Arc<str> {
+    let kept = index
+        .get_key_value(pattern)
+        .map(|(kept, _)| kept.clone())
+        .expect("the pattern is kept");
+    remove(index, pattern, |slots| {
+        let at = slots
+            .iter()
+            .position(|other| Arc::ptr_eq(other, slot))
+            .expect("the index holds the entry");
+        slots.swap_remove(at)
+    });
+    kept
 }
 
 fn add(index: &mut Index, pattern: &Arc<str>, slot: &Arc<Slot>) {
@@ -712,6 +812,72 @@ mod tests {
         let len = cache.state().index.values().map(Vec::len).sum::<usize>();
         assert_eq!(cache.len(), len);
         keys(&cache);
+    }
+
+    #[test]
+    fn a_pinned_entry_is_never_evicted() {
+        let cache = RegexCache::new(RegexCacheOptions::default().with_capacity(2));
+        cache.prewarm("p", 0).unwrap();
+        let pinned = cache.get("p", DEFAULT);
+        for i in 0..100 {
+            cache.get(&format!("x{i}"), DEFAULT);
+        }
+        assert!(same(&pinned, &cache.lookup("p", DEFAULT).unwrap()));
+        // outside the capacity
+        assert_eq!((cache.len(), cache.pinned_len()), (3, 1));
+        assert_eq!(
+            keys(&cache),
+            [
+                format!("p@{DEFAULT}"),
+                format!("x98@{DEFAULT}"),
+                format!("x99@{DEFAULT}")
+            ]
+        );
+    }
+
+    #[test]
+    fn pinning_takes_over_a_kept_entry() {
+        let cache = RegexCache::new(RegexCacheOptions::default().with_capacity(2));
+        let kept = cache.get("p", DEFAULT);
+        cache.prewarm("p", 0).unwrap();
+        // the same regex, compiled once, now pinned
+        assert!(same(&kept, &cache.lookup("p", DEFAULT).unwrap()));
+        assert_eq!((cache.len(), cache.pinned_len()), (1, 1));
+        cache.prewarm("p", 0).unwrap();
+        assert_eq!((cache.len(), cache.pinned_len()), (1, 1));
+        // an invalid pattern is pinned as its error
+        assert!(cache.prewarm("(", 0).is_err());
+        assert_eq!(cache.pinned_len(), 2);
+        assert_eq!(cache.get("(", DEFAULT).built(), 0);
+    }
+
+    #[test]
+    fn pins_bypass_the_capacity_and_the_pattern_length() {
+        let cache = RegexCache::new(
+            RegexCacheOptions::default()
+                .with_capacity(0)
+                .with_max_pattern_len(2),
+        );
+        cache.prewarm("long pattern", 0).unwrap();
+        assert!(cache.lookup("long pattern", DEFAULT).is_some());
+        // and nothing else is kept
+        cache.get("other pattern", DEFAULT);
+        assert_eq!((cache.len(), cache.pinned_len()), (1, 1));
+    }
+
+    #[test]
+    fn unpin_and_clear_drop_pins() {
+        let cache = RegexCache::default();
+        cache.prewarm("p", 0).unwrap();
+        cache.prewarm("p", 1024).unwrap();
+        assert!(!cache.unpin("q", 0));
+        assert!(cache.unpin("p", 0));
+        assert!(!cache.unpin("p", 0));
+        assert!(cache.lookup("p", DEFAULT).is_none());
+        assert_eq!(keys(&cache), ["p@1024"]);
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.pinned_len(), 0);
     }
 
     #[test]

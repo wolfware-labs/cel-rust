@@ -201,7 +201,10 @@ impl RuntimeOptions {
     /// each runs, and paid only by the call that compiles it: the
     /// [`Env`](crate::Env)'s [`RegexCache`](crate::RegexCache) keeps it for
     /// later calls) and by the size of its compiled automaton times the
-    /// subject's length, charged before matching.
+    /// subject's length, charged before matching. Other evaluations sharing
+    /// the Env can evict a kept pattern: size the budget for compiling every
+    /// pattern the expression matches, unless they are pinned with
+    /// [`RegexCache::prewarm`](crate::RegexCache::prewarm).
     /// Comparisons (`==`, `!=`, `in`) are charged by a walk of their
     /// operands, one step per element and per 64 bytes of string. Creating a
     /// value costs one step per element or entry, or per 64 bytes of a string
