@@ -180,6 +180,8 @@ struct State {
     bytes: u64,
     /// The pinned entries, which are never evicted.
     pinned: usize,
+    /// The bytes of the pinned entries, see [`Slot::bytes`].
+    pinned_bytes: u64,
 }
 
 fn find<'a>(index: &'a Index, pattern: &str, size_limit: usize) -> Option<&'a Arc<Slot>> {
@@ -379,6 +381,19 @@ impl RegexCache {
         self.state().pinned
     }
 
+    /// The bytes the pinned patterns hold (see [`prewarm`](Self::prewarm)):
+    /// the sum of the sizes of their compiled automata, a pattern pinned as
+    /// its error counting the length of the error message.
+    ///
+    /// Pins count against neither the capacity nor the
+    /// [bytes](RegexCacheOptions::with_max_bytes) of the cache: bound them
+    /// with this. Each automaton is at most the size limit it was compiled
+    /// under, plus a lazy DFA cache per thread that matches it, of up to
+    /// that limit (2 MiB at most), which this does not count.
+    pub fn pinned_bytes(&self) -> usize {
+        usize::try_from(self.state().pinned_bytes).unwrap_or(usize::MAX)
+    }
+
     /// Whether the cache holds no compiled pattern.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -392,6 +407,7 @@ impl RegexCache {
         state.len = 0;
         state.bytes = 0;
         state.pinned = 0;
+        state.pinned_bytes = 0;
         for replica in self.replicas.iter() {
             evicted.push(std::mem::take(&mut *write(replica)));
         }
@@ -410,7 +426,8 @@ impl RegexCache {
     /// [bytes](RegexCacheOptions::with_max_bytes) of the cache, whatever its
     /// size or length: only [`unpin`](Self::unpin) and [`clear`](Self::clear)
     /// drop it. Pin only the patterns you trust, such as those of the rules
-    /// you load.
+    /// you load, and bound what they hold with
+    /// [`pinned_bytes`](Self::pinned_bytes).
     ///
     /// Under a budget, a pattern that is not pinned is charged its compile
     /// whenever the cache does not hold it, which any evaluation sharing the
@@ -454,6 +471,7 @@ impl RegexCache {
         };
         let pattern = remove_slot(&mut state.index, pattern, &slot);
         state.pinned -= 1;
+        state.pinned_bytes -= slot.bytes;
         self.any_pinned.store(state.pinned > 0, Ordering::Relaxed);
         self.apply(&[(pattern, slot)], None);
         true
@@ -475,6 +493,7 @@ impl RegexCache {
         }
         let pattern = self.add(&mut state, pattern, size_limit, compiled.clone(), true);
         state.pinned += 1;
+        state.pinned_bytes += pattern.1.bytes;
         self.any_pinned.store(true, Ordering::Relaxed);
         self.apply(&removed, Some(&pattern));
         drop(state);
@@ -978,6 +997,31 @@ mod tests {
                 format!("x99@{DEFAULT}")
             ]
         );
+    }
+
+    #[test]
+    fn pinned_bytes_sum_the_pinned_entries() {
+        let cache = RegexCache::new(RegexCacheOptions::default());
+        assert_eq!(cache.pinned_bytes(), 0);
+        cache.prewarm(r"\w{4}", 0).unwrap();
+        cache.prewarm("^/api/", 1 << 20).unwrap();
+        let word = cache.get(r"\w{4}", DEFAULT).built();
+        let api = cache.get("^/api/", 1 << 20).built();
+        assert!(word > 10_000, "{word}");
+        assert_eq!(cache.pinned_bytes(), (word + api) as usize);
+        // a kept entry is not counted, nor pinning one again
+        cache.get("other", DEFAULT);
+        cache.prewarm(r"\w{4}", 0).unwrap();
+        assert_eq!(cache.pinned_bytes(), (word + api) as usize);
+        // a pinned error holds its message
+        let message = cache.prewarm("(", 0).unwrap_err().to_string();
+        assert!(cache.pinned_bytes() > (word + api) as usize);
+        assert!(cache.pinned_bytes() <= (word + api) as usize + message.len());
+        assert!(cache.unpin("(", 0));
+        assert!(cache.unpin(r"\w{4}", 0));
+        assert_eq!(cache.pinned_bytes(), api as usize);
+        cache.clear();
+        assert_eq!(cache.pinned_bytes(), 0);
     }
 
     #[test]
