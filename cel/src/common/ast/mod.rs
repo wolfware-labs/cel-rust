@@ -208,7 +208,18 @@ impl SourceInfo {
         self.offsets.get(&id).map(|range| (range.start, range.stop))
     }
 
-    pub(crate) fn pos_for(&self, id: u64) -> Option<(isize, isize)> {
+    /// 1-based line and column of the expression `id`, or `None` for
+    /// synthesized nodes.
+    ///
+    /// ```
+    /// use cel::common::ast::Expr;
+    /// use cel::parser::Parser;
+    ///
+    /// let (ast, info) = Parser::default().parse_with_source_info("1 +\n  x").unwrap();
+    /// let Expr::Call(call) = &ast.expr else { unreachable!() };
+    /// assert_eq!(info.pos_for(call.args[1].id), Some((2, 3)));
+    /// ```
+    pub fn pos_for(&self, id: u64) -> Option<(isize, isize)> {
         match self.offset_for(id) {
             Some((start, _)) => {
                 let start = start as isize;
@@ -240,7 +251,21 @@ pub struct OffsetRange {
 
 #[cfg(test)]
 mod tests {
-    use super::IdedExpr;
+    use super::{Expr, IdedExpr};
+
+    #[test]
+    fn pos_for_reports_the_line_and_column_of_an_expression() {
+        let (ast, info) = crate::parser::Parser::default()
+            .parse_with_source_info("1 +\n  x")
+            .unwrap();
+        let Expr::Call(call) = &ast.expr else {
+            panic!("not a call: {ast:?}");
+        };
+        let x = &call.args[1];
+        assert_eq!(x.expr, Expr::Ident("x".into()));
+        assert_eq!(info.pos_for(x.id), Some((2, 3)));
+        assert_eq!(info.pos_for(u64::MAX), None);
+    }
 
     /// Checks `qualified_name_segments`, and `qualified_name_root`, against the
     /// AST of every parser backend.

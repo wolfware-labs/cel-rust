@@ -87,6 +87,20 @@ pub(crate) fn size_limit(regex_size_limit: u64) -> usize {
 /// `max_bytes + capacity × T × (2 MiB + automaton + budget_dfa_bytes +
 /// least + NFA)`, plus the pinned patterns and their scratch space.
 ///
+/// For the pinned patterns, [`RegexCache::pinned_bytes`] is their automata,
+/// and [`RegexCache::pinned_entry_bytes`] one pattern's share of it;
+/// [`RegexCache::pinned_scratch_min_bytes`] is the sum of the `least` of
+/// each, so that per thread matching them under a budget, their lazy DFA
+/// caches hold at most `pinned_scratch_min_bytes() + pinned_len() ×
+/// budget_dfa_bytes`.
+///
+/// `pinned_scratch_min_bytes` is the lazy DFA's minimum only. It excludes
+/// each thread's PikeVM cache, about the size of the NFA, so up to about
+/// `pinned_bytes()` per thread, and it counts zero for a pattern matched by
+/// the PikeVM alone and for one pinned as its error. To bound the total
+/// scratch space of the pinned patterns, add `pinned_bytes()` per worker
+/// thread.
+///
 /// Without an evaluation budget, patterns compile under the `regex` crate's
 /// default limits, so an automaton is up to 10 MiB: with the defaults, at
 /// most 64 MiB of automata, plus 64 × `T` × ~2 MiB of scratch space. Under
@@ -225,6 +239,9 @@ struct State {
     pinned: usize,
     /// The bytes of the pinned entries, see [`Slot::bytes`].
     pinned_bytes: u64,
+    /// The least lazy DFA cache capacities of the pinned entries, see
+    /// [`Compiled::least_scratch_bytes`].
+    pinned_scratch_min: u64,
 }
 
 fn find<'a>(index: &'a Index, pattern: &str, size_limit: usize) -> Option<&'a Arc<Slot>> {
@@ -331,6 +348,16 @@ impl Compiled {
     /// The bytes of the automata matching under a budget, see [`Scanner`].
     pub(crate) fn scanner_bytes(&self) -> u64 {
         self.scanner.as_ref().map_or(0, |scanner| scanner.bytes())
+    }
+
+    /// The least lazy DFA cache capacity matching under a budget needs,
+    /// which each thread's cache holds up to
+    /// [`budget_dfa_bytes`](RegexCacheOptions::with_budget_dfa_bytes)
+    /// beyond: zero without a lazy DFA, see [`Scanner::least_cache_bytes`].
+    fn least_scratch_bytes(&self) -> u64 {
+        self.scanner
+            .as_ref()
+            .map_or(0, |scanner| scanner.least_cache_bytes())
     }
 
     /// This compiled pattern without the automata matching under a budget.
@@ -443,6 +470,36 @@ impl RegexCache {
         usize::try_from(self.state().pinned_bytes).unwrap_or(usize::MAX)
     }
 
+    /// The bytes `pattern`, pinned under `regex_size_limit` (see
+    /// [`prewarm`](Self::prewarm)), holds, as [`pinned_bytes`](Self::pinned_bytes)
+    /// counts them: `None` unless the pattern is pinned under that limit.
+    pub fn pinned_entry_bytes(&self, pattern: &str, regex_size_limit: u64) -> Option<usize> {
+        let state = self.state();
+        let slot = find(&state.index, pattern, size_limit(regex_size_limit))?;
+        slot.pinned
+            .then(|| usize::try_from(slot.bytes).unwrap_or(usize::MAX))
+    }
+
+    /// The least scratch space the pinned patterns need, per thread
+    /// matching them all under a budget: the sum of the least lazy DFA
+    /// cache capacity each one's automaton needs, which its cache holds up
+    /// to [`budget_dfa_bytes`](RegexCacheOptions::with_budget_dfa_bytes)
+    /// beyond (see [Memory](RegexCacheOptions#memory)). A pattern without a
+    /// lazy DFA, such as one pinned as its error, counts zero.
+    ///
+    /// Per thread, the lazy DFA caches of the pinned patterns so hold at most
+    /// this plus `pinned_len() × budget_dfa_bytes`.
+    ///
+    /// This is the lazy DFA's minimum only. It excludes each thread's PikeVM
+    /// cache, about the size of the NFA, so up to about
+    /// [`pinned_bytes`](Self::pinned_bytes) per thread, and counts zero for
+    /// a pattern matched by the PikeVM alone and for one pinned as its
+    /// error. To bound the total scratch space of the pinned patterns, add
+    /// `pinned_bytes()` per worker thread.
+    pub fn pinned_scratch_min_bytes(&self) -> usize {
+        usize::try_from(self.state().pinned_scratch_min).unwrap_or(usize::MAX)
+    }
+
     /// Whether the cache holds no compiled pattern.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -457,6 +514,7 @@ impl RegexCache {
         state.bytes = 0;
         state.pinned = 0;
         state.pinned_bytes = 0;
+        state.pinned_scratch_min = 0;
         for replica in self.replicas.iter() {
             evicted.push(std::mem::take(&mut *write(replica)));
         }
@@ -525,6 +583,7 @@ impl RegexCache {
         let pattern = remove_slot(&mut state.index, pattern, &slot);
         state.pinned -= 1;
         state.pinned_bytes -= slot.bytes;
+        state.pinned_scratch_min -= slot.compiled.least_scratch_bytes();
         self.any_pinned.store(state.pinned > 0, Ordering::Relaxed);
         self.apply(&[(pattern, slot)], None);
         true
@@ -547,6 +606,7 @@ impl RegexCache {
         let pattern = self.add(&mut state, pattern, size_limit, compiled.clone(), true);
         state.pinned += 1;
         state.pinned_bytes += pattern.1.bytes;
+        state.pinned_scratch_min += pattern.1.compiled.least_scratch_bytes();
         self.any_pinned.store(true, Ordering::Relaxed);
         self.apply(&removed, Some(&pattern));
         drop(state);
@@ -1049,6 +1109,49 @@ mod tests {
         assert_eq!(cache.pinned_bytes(), api as usize);
         cache.clear();
         assert_eq!(cache.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn pinned_entry_bytes_reports_a_pinned_pattern_and_nothing_else() {
+        let cache = RegexCache::new(RegexCacheOptions::default());
+        cache.prewarm("^a+$", 1 << 20).unwrap();
+        let bytes = cache.pinned_entry_bytes("^a+$", 1 << 20).expect("pinned");
+        assert!(bytes > 0);
+        assert_eq!(bytes, cache.pinned_bytes());
+        assert_eq!(cache.pinned_entry_bytes("^a+$", 1 << 19), None); // other key
+        assert_eq!(cache.pinned_entry_bytes("^b$", 1 << 20), None);
+    }
+
+    #[test]
+    fn pinned_scratch_min_bytes_sums_pinned_entries() {
+        let cache = RegexCache::new(RegexCacheOptions::default());
+        assert_eq!(cache.pinned_scratch_min_bytes(), 0);
+        cache.prewarm("^a+$", 1 << 20).unwrap();
+        let one = cache.pinned_scratch_min_bytes();
+        assert!(one > 0);
+        cache.prewarm(r"\w{8}x", 1 << 20).unwrap();
+        assert!(cache.pinned_scratch_min_bytes() > one);
+        cache.clear();
+        assert_eq!(cache.pinned_scratch_min_bytes(), 0);
+    }
+
+    #[test]
+    fn pinned_scratch_min_bytes_tracks_unpins_repins_and_errors() {
+        let cache = RegexCache::new(RegexCacheOptions::default());
+        cache.prewarm("^a+$", 1 << 20).unwrap();
+        let single = cache.pinned_scratch_min_bytes();
+        assert!(single > 0);
+        cache.prewarm(r"\w{8}x", 1 << 20).unwrap();
+        assert!(cache.pinned_scratch_min_bytes() > single);
+        assert!(cache.unpin(r"\w{8}x", 1 << 20));
+        assert_eq!(cache.pinned_scratch_min_bytes(), single);
+        // pinning the remaining pattern again does not count it twice
+        cache.prewarm("^a+$", 1 << 20).unwrap();
+        assert_eq!(cache.pinned_scratch_min_bytes(), single);
+        // a pattern pinned as its error has no lazy DFA
+        assert!(cache.prewarm("(", 1 << 20).is_err());
+        assert_eq!(cache.pinned_len(), 2);
+        assert_eq!(cache.pinned_scratch_min_bytes(), single);
     }
 
     #[test]

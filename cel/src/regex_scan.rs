@@ -64,6 +64,9 @@ pub(crate) struct Scanner {
     /// The bytes an empty lazy DFA cache holds: after its cache is cleared,
     /// what it holds beyond this is the states built since.
     empty_cache: u64,
+    /// The least lazy DFA cache capacity the automaton needs, which the
+    /// cache capacity adds `state_bytes` to: zero without a lazy DFA.
+    least_cache: u64,
     /// The literal characters and classes of the pattern, a repetition
     /// counting its copies, plus its Unicode word-boundary assertions: at
     /// most how many NFA threads the slower engine steps at each byte,
@@ -114,7 +117,7 @@ impl Scanner {
         let config = hybrid::dfa::Config::new()
             .unicode_word_boundary(true)
             .minimum_cache_clear_count(None);
-        let dfa = config
+        let (dfa, least_cache) = config
             .get_minimum_cache_capacity(&nfa)
             .ok()
             .and_then(|least| {
@@ -122,7 +125,9 @@ impl Scanner {
                     .configure(config.cache_capacity(least.saturating_add(state_bytes)))
                     .build_from_nfa(nfa.clone())
                     .ok()
-            });
+                    .map(|dfa| (Some(dfa), least as u64))
+            })
+            .unwrap_or((None, 0));
         let stride = dfa
             .as_ref()
             .map_or(0, |dfa| 1u64 << dfa.byte_classes().stride2());
@@ -144,6 +149,7 @@ impl Scanner {
             nfa_states: nfa.states().len() as u64,
             stride,
             empty_cache,
+            least_cache,
             positions: positions(hir),
         })
     }
@@ -152,6 +158,13 @@ impl Scanner {
     /// matching them.
     pub(crate) fn bytes(&self) -> u64 {
         self.nfa_bytes
+    }
+
+    /// The least lazy DFA cache capacity the automaton needs, which each
+    /// thread's cache holds up to `state_bytes` beyond (see
+    /// [`new`](Self::new)): zero when every match runs the slower engine.
+    pub(crate) fn least_cache_bytes(&self) -> u64 {
+        self.least_cache
     }
 
     /// Whether the pattern matches `subject`, as the `meta` regex answers,
@@ -455,6 +468,7 @@ mod tests {
                 .unicode_word_boundary(true)
                 .get_minimum_cache_capacity(scanner.dfa.as_ref().unwrap().get_nfa())
                 .unwrap();
+            assert_eq!(scanner.least_cache_bytes(), least as u64);
             assert!(held <= least + state_bytes, "{held} {least} {state_bytes}");
             // the same subject again: what was cleared is built and charged again
             assert!(scanner
