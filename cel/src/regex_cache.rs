@@ -94,6 +94,13 @@ pub(crate) fn size_limit(regex_size_limit: u64) -> usize {
 /// caches hold at most `pinned_scratch_min_bytes() + pinned_len() ×
 /// budget_dfa_bytes`.
 ///
+/// `pinned_scratch_min_bytes` is the lazy DFA's minimum only. It excludes
+/// each thread's PikeVM cache, about the size of the NFA, so up to about
+/// `pinned_bytes()` per thread, and it counts zero for a pattern matched by
+/// the PikeVM alone and for one pinned as its error. To bound the total
+/// scratch space of the pinned patterns, add `pinned_bytes()` per worker
+/// thread.
+///
 /// Without an evaluation budget, patterns compile under the `regex` crate's
 /// default limits, so an automaton is up to 10 MiB: with the defaults, at
 /// most 64 MiB of automata, plus 64 × `T` × ~2 MiB of scratch space. Under
@@ -482,6 +489,13 @@ impl RegexCache {
     ///
     /// Per thread, the lazy DFA caches of the pinned patterns so hold at most
     /// this plus `pinned_len() × budget_dfa_bytes`.
+    ///
+    /// This is the lazy DFA's minimum only. It excludes each thread's PikeVM
+    /// cache, about the size of the NFA, so up to about
+    /// [`pinned_bytes`](Self::pinned_bytes) per thread, and counts zero for
+    /// a pattern matched by the PikeVM alone and for one pinned as its
+    /// error. To bound the total scratch space of the pinned patterns, add
+    /// `pinned_bytes()` per worker thread.
     pub fn pinned_scratch_min_bytes(&self) -> usize {
         usize::try_from(self.state().pinned_scratch_min).unwrap_or(usize::MAX)
     }
@@ -1119,6 +1133,25 @@ mod tests {
         assert!(cache.pinned_scratch_min_bytes() > one);
         cache.clear();
         assert_eq!(cache.pinned_scratch_min_bytes(), 0);
+    }
+
+    #[test]
+    fn pinned_scratch_min_bytes_tracks_unpins_repins_and_errors() {
+        let cache = RegexCache::new(RegexCacheOptions::default());
+        cache.prewarm("^a+$", 1 << 20).unwrap();
+        let single = cache.pinned_scratch_min_bytes();
+        assert!(single > 0);
+        cache.prewarm(r"\w{8}x", 1 << 20).unwrap();
+        assert!(cache.pinned_scratch_min_bytes() > single);
+        assert!(cache.unpin(r"\w{8}x", 1 << 20));
+        assert_eq!(cache.pinned_scratch_min_bytes(), single);
+        // pinning the remaining pattern again does not count it twice
+        cache.prewarm("^a+$", 1 << 20).unwrap();
+        assert_eq!(cache.pinned_scratch_min_bytes(), single);
+        // a pattern pinned as its error has no lazy DFA
+        assert!(cache.prewarm("(", 1 << 20).is_err());
+        assert_eq!(cache.pinned_len(), 2);
+        assert_eq!(cache.pinned_scratch_min_bytes(), single);
     }
 
     #[test]
